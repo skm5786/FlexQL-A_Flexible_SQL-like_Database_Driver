@@ -171,7 +171,7 @@ typedef struct Table {
     Row            *tail;                      /* Last row (newest) — L6     */
     uint64_t        row_count;                 /* Live (non-expired) rows    */
     uint64_t        next_row_id;               /* Monotonic insert counter   */
-    pthread_mutex_t lock;                      /* Per-table mutex            */
+    pthread_rwlock_t lock;  /* RW lock: readers share, writer exclusive (L9) */
     struct HashIndex *pk_index;                /* PK hash index, or NULL     */
     struct Table    *next;                     /* Unused (reserved)          */
 } Table;
@@ -287,12 +287,35 @@ typedef struct {
     int       col_count;
 } CreateTableParams;
 
-/* INSERT parameters */
+/* ── Batch INSERT ─────────────────────────────────────────────────────────
+ *
+ * LESSON 7: Batch INSERT grammar:
+ *   INSERT INTO t VALUES (r1_c1, r1_c2), (r2_c1, r2_c2), ..., (rN_c1, rN_c2);
+ *
+ * Design: row 0 stays in values[][] (existing layout, zero overhead for
+ * single-row inserts).  Rows 1..N-1 are heap-allocated in extra_rows.
+ * The executor frees extra_rows after processing the batch.
+ *
+ * WHY a pointer instead of a large 2D array?
+ *   A static char[MAX_BATCH][64][256] embedded here would blow up
+ *   InsertParams from 16 KB to 160 MB — too large for the stack.
+ *   The pointer keeps InsertParams at 16 KB while batch data lives on
+ *   the heap and is freed immediately after each INSERT statement.
+ *
+ * BACKWARD COMPAT: single-row INSERT sets batch_row_count=1, extra_rows=NULL.
+ *   All existing test code continues to work unchanged.
+ * ─────────────────────────────────────────────────────────────────────────*/
+#define FLEXQL_MAX_BATCH_ROWS 10000  /* max tuples per batch INSERT          */
+
 typedef struct {
     char   table_name[FLEXQL_MAX_NAME_LEN];
-    char   values[FLEXQL_MAX_COLUMNS][FLEXQL_MAX_VARCHAR];
-    int    value_count;
-    time_t expiry;   /* Parsed from VALUES — last field if TTL syntax used   */
+    char   values[FLEXQL_MAX_COLUMNS][FLEXQL_MAX_VARCHAR]; /* row 0 (inline) */
+    int    value_count;       /* number of columns per row                   */
+    int    batch_row_count;   /* total row tuples (1 = single, N = batch)    */
+    int    extra_capacity;    /* allocated slots in extra_rows (for doubling)*/
+    time_t expiry;
+    /* Rows 1..batch_row_count-1. Freed by executor after all rows inserted. */
+    char (*extra_rows)[FLEXQL_MAX_COLUMNS][FLEXQL_MAX_VARCHAR];
 } InsertParams;
 
 /* SELECT / INNER JOIN parameters */

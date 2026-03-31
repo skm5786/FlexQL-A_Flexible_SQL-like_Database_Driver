@@ -20,6 +20,7 @@
 #include "common/types.h"
 #include "storage/dbmanager.h"
 #include "storage/storage.h"
+#include "storage/wal.h"
 #include "cache/cache.h"
 
 /* ── Wire helpers (unchanged) ────────────────────────────────────────────── */
@@ -278,6 +279,8 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
             if(errmsg)*errmsg=err; else free(err);
             send_err(client_fd,err?err:"CREATE DATABASE failed"); return -1;
         }
+        /* LESSON 8: Persist named databases to registry */
+        wal_register_db(query->params.db.db_name);
         snprintf(buf,sizeof(buf),"Database '%s' created successfully.",query->params.db.db_name);
         send_ok(client_fd,buf); return 0;
     }
@@ -303,8 +306,9 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
     case QUERY_DROP_DB: {
         if(*current_db&&strcasecmp((*current_db)->name,query->params.db.db_name)==0)
             *current_db=nullptr;
-        /* Lesson 5: invalidate all cache entries for this database */
         if(cache) cache_invalidate_db(cache, query->params.db.db_name);
+        /* LESSON 8: Remove from registry before dropping from memory */
+        wal_unregister_db(query->params.db.db_name);
         char *err=nullptr;
         if(dbmgr_drop(mgr,query->params.db.db_name,&err)!=0){
             if(errmsg)*errmsg=err; else free(err);
@@ -337,6 +341,8 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
             if(errmsg)*errmsg=err; else free(err);
             send_err(client_fd,err?err:"CREATE TABLE failed"); return -1;
         }
+        /* LESSON 8: Persist table schema to WAL (group commit: schema is small) */
+        wal_write_create_table(db_name, t);
         snprintf(buf,sizeof(buf),"Table '%s' created.",t->name);
         send_ok(client_fd,buf); return 0;
     }
@@ -348,19 +354,123 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         Table *t=table_find(*current_db,p->table_name);
         if(!t){
             snprintf(buf,sizeof(buf),"Table '%s' does not exist",p->table_name);
-            if(errmsg)*errmsg=strdup(buf); send_err(client_fd,buf); return -1;
+            if(errmsg)*errmsg=strdup(buf); send_err(client_fd,buf);
+            /* Free batch memory before returning */
+            free(p->extra_rows);
+            return -1;
         }
-        char *err=nullptr;
-        if(row_insert(t,p->values,p->value_count,p->expiry,&err)!=0){
-            if(errmsg)*errmsg=err; else free(err);
-            send_err(client_fd,err?err:"INSERT failed"); return -1;
+
+        /* ── LESSON 7: Batch INSERT loop ────────────────────────────────────
+         *
+         * BEFORE (single-row only):
+         *   row_insert(t, p->values, p->value_count, p->expiry, &err)
+         *   → 1 TCP message = 1 row inserted = 1 MSG_OK reply
+         *
+         * AFTER (batch):
+         *   for i in 0..batch_row_count-1:
+         *     row_insert(t, row_i_values, p->value_count, p->expiry, &err)
+         *   → 1 TCP message = N rows inserted = 1 MSG_OK reply
+         *
+         * PERFORMANCE:
+         *   Benchmark sends INSERT INTO BIG_USERS VALUES (r1),(r2),...,(rN);
+         *   With N=1000: 1M rows = 1000 TCP roundtrips instead of 1,000,000.
+         *   Each roundtrip is eliminated entirely — not just made faster.
+         *
+         * ERROR SEMANTICS:
+         *   If any row fails (e.g. PK dupe), we stop and return error.
+         *   Rows inserted before the failure remain committed (no rollback).
+         *   This matches SQLite behaviour for multi-row INSERT.
+         *   Full rollback requires transactions (future work).
+         *
+         * MEMORY:
+         *   Row 0 is in p->values[] (inline, no allocation).
+         *   Rows 1..N-1 are in p->extra_rows (heap, freed after all inserts).
+         *   extra_rows is NULL when batch_row_count == 1 (single-row path).   */
+
+        /* ── LESSON 8: Write ALL rows to WAL BEFORE in-memory insert ────────
+         *
+         * WHY BEFORE?
+         *   The WAL is our crash-recovery guarantee.  The sequence must be:
+         *     1. Write rows to WAL + fdatasync()  ← DURABLE on disk
+         *     2. Insert rows into RAM linked list + indexes
+         *     3. Send MSG_OK to client
+         *
+         *   If we crash between step 1 and 2: on restart, WAL replay re-inserts
+         *   the rows.  Client gets MSG_OK → data is durable. ✓
+         *
+         *   If we crash between step 2 and 3: rows are in RAM and WAL.
+         *   Client never got MSG_OK so it will retry.  WAL replay may insert
+         *   duplicate rows — for tables WITH a PK this is caught by the dupe
+         *   check.  For tables WITHOUT a PK, duplicates appear.  Production
+         *   databases solve this with transaction IDs (future work).
+         *
+         * GROUP COMMIT: all N batch rows are written in ONE write() + ONE
+         * fdatasync().  Cost: O(1) disk syncs per batch INSERT statement,
+         * regardless of batch size.  This is the key to high write throughput.
+         *
+         * Build a flat string pointer array for wal_write_insert_batch.
+         * Row 0 is in p->values, rows 1..N-1 are in p->extra_rows.       */
+        if (wal_is_persistent(db_name)) {
+            /* Build flat array: row_count * value_count string pointers  */
+            int total_vals = p->batch_row_count * p->value_count;
+            const char **flat = (const char**)malloc(
+                (size_t)total_vals * sizeof(const char*));
+            if (flat) {
+                for (int r = 0; r < p->batch_row_count; r++) {
+                    const char (*rv)[FLEXQL_MAX_VARCHAR] =
+                        (r == 0) ? p->values
+                                 : p->extra_rows[r-1];
+                    for (int c = 0; c < p->value_count; c++)
+                        flat[r * p->value_count + c] = rv[c];
+                }
+                wal_write_insert_batch(db_name, p->table_name, t,
+                                       flat,
+                                       p->batch_row_count, p->value_count,
+                                       p->expiry);
+                free(flat);
+            }
         }
-        /* ── LESSON 5: Invalidate cache for this table ──────────────────────
-         * Any cached SELECT that referenced this table is now stale because
-         * a new row was added.  We must remove those entries so the next
-         * SELECT re-runs the scan and sees the new data.                   */
+
+        char *ins_err = nullptr;
+        int   rows_inserted = 0;
+
+        for (int r = 0; r < p->batch_row_count; r++) {
+            /* Get the pointer to this row's values array */
+            const char (*row_vals)[FLEXQL_MAX_VARCHAR];
+            if (r == 0) {
+                row_vals = p->values;
+            } else {
+                row_vals = p->extra_rows[r - 1];
+            }
+
+            if (row_insert(t,
+                           (const char(*)[FLEXQL_MAX_VARCHAR])row_vals,
+                           p->value_count,
+                           p->expiry,
+                           &ins_err) != 0) {
+                /* Insert failed — stop, report, clean up heap, return error */
+                if (errmsg) *errmsg = ins_err; else free(ins_err);
+                send_err(client_fd, ins_err ? ins_err : "INSERT failed");
+                free(p->extra_rows);
+                return -1;
+            }
+            rows_inserted++;
+        }
+
+        /* Free the heap-allocated extra rows (NULL-safe) */
+        free(p->extra_rows);
+
+        /* Invalidate cache once for all inserted rows */
         if(cache) cache_invalidate_table(cache, db_name, p->table_name);
-        send_ok(client_fd,"1 row inserted."); return 0;
+
+        /* Report total rows inserted */
+        if (p->batch_row_count == 1) {
+            send_ok(client_fd, "1 row inserted.");
+        } else {
+            snprintf(buf, sizeof(buf), "%d rows inserted.", rows_inserted);
+            send_ok(client_fd, buf);
+        }
+        return 0;
     }
 
     /* ── SELECT ───────────────────────────────────────────────────────────── */

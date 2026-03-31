@@ -31,7 +31,7 @@ BIN_DIR    := bin
 # ── Source files ──────────────────────────────────────────────────────────
 # Client sources
 CLIENT_SRCS := src/client/main.cpp \
-               src/client/flexql_api.cpp \
+               src/client/flexql_api.cpp
 
 # Server sources (will grow as we implement each module)
 SERVER_SRCS := src/server/server.cpp \
@@ -39,6 +39,7 @@ SERVER_SRCS := src/server/server.cpp \
                src/parser/parser.cpp \
                src/storage/dbmanager.cpp \
                src/storage/storage.cpp \
+               src/storage/wal.cpp \
                src/index/index.cpp \
                src/cache/cache.cpp \
                src/expiration/expiration.cpp \

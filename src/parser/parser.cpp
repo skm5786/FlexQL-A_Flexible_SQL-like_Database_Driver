@@ -209,42 +209,147 @@ static int parse_create(Lexer *lx, QueryNode *out, char **errmsg){
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  * parse_insert
- * Grammar: INSERT INTO ident VALUES '(' literal (',' literal)* ')' ';'
+ * Grammar (Lesson 7 — Batch INSERT):
+ *   INSERT INTO ident VALUES tuple (',' tuple)* ';'
+ *   tuple ::= '(' literal (',' literal)* ')'
  *
- * LESSON: Values stored as raw strings; executor converts to typed cells.
+ * LESSON 7 — HOW BATCH INSERT WORKS IN THE PARSER:
+ *
+ *   Old grammar (single tuple):
+ *     INSERT INTO users VALUES (1, 'Alice', 95.0);
+ *
+ *   New grammar (multiple tuples, separated by commas):
+ *     INSERT INTO users VALUES (1,'Alice',95.0), (2,'Bob',88.0), (3,'Carol',72.0);
+ *
+ *   The extension is minimal — after parsing the FIRST closing ')' we
+ *   peek at the next token:
+ *     COMMA  → another tuple follows → parse it → peek again
+ *     SEMI   → done
+ *
+ *   Row 0 is stored in p->values[][] (the existing inline array).
+ *   Rows 1..N-1 are stored in p->extra_rows (heap-allocated on demand).
+ *
+ *   The executor receives batch_row_count and iterates over all rows.
+ *   It frees extra_rows after all inserts succeed or any fails.
+ *
+ * WHY THIS IS THE RIGHT PLACE FOR THE CHANGE:
+ *   The parser is the ONLY place the SQL text is read.  The executor and
+ *   storage engine don't touch SQL strings — they work on QueryNode fields.
+ *   Adding multi-tuple parsing here means zero changes to the storage layer.
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-static int parse_insert(Lexer *lx, QueryNode *out, char **errmsg){
-    out->type=QUERY_INSERT;
-    InsertParams *p=&out->params.insert;
-    p->value_count=0; p->expiry=0;
+static int parse_one_tuple(Lexer *lx, InsertParams *p, int row_idx, char **errmsg) {
+    /* row_idx==0: store into p->values[]
+       row_idx> 0: store into p->extra_rows[row_idx-1][]               */
+    if (lexer_expect(lx, PUNCT_LPAREN, nullptr, errmsg) != 0) return -1;
 
-    lexer_next(lx); /* consume INSERT */
-    if(lexer_expect(lx,KW_INTO,nullptr,errmsg)!=0) return -1;
-    Token tn; if(lexer_expect(lx,TOK_IDENT,&tn,errmsg)!=0) return -1;
-    strncpy(p->table_name,tn.text,FLEXQL_MAX_NAME_LEN-1);
-    if(lexer_expect(lx,KW_VALUES,nullptr,errmsg)!=0) return -1;
-    if(lexer_expect(lx,PUNCT_LPAREN,nullptr,errmsg)!=0) return -1;
-
-    for(;;){
-        if(p->value_count>=FLEXQL_MAX_COLUMNS){
-            set_err(errmsg,"Too many values in INSERT"); return -1;
+    int col = 0;
+    for (;;) {
+        if (col >= FLEXQL_MAX_COLUMNS) {
+            set_err(errmsg, "Too many values in INSERT tuple"); return -1;
         }
-        Token v=lexer_next(lx);
-        if(v.type==TOK_INTEGER||v.type==TOK_DECIMAL||
-           v.type==TOK_STRING ||v.type==TOK_IDENT||v.type==KW_NULL){
-            if(v.type==KW_NULL) p->values[p->value_count][0]='\0';
-            else strncpy(p->values[p->value_count],v.text,FLEXQL_MAX_VARCHAR-1);
-            p->value_count++;
+        Token v = lexer_next(lx);
+        if (v.type == TOK_INTEGER || v.type == TOK_DECIMAL ||
+            v.type == TOK_STRING  || v.type == TOK_IDENT  || v.type == KW_NULL) {
+            char *dst;
+            if (row_idx == 0) {
+                dst = p->values[col];
+            } else {
+                dst = p->extra_rows[row_idx - 1][col];
+            }
+            if (v.type == KW_NULL) dst[0] = '\0';
+            else strncpy(dst, v.text, FLEXQL_MAX_VARCHAR - 1);
         } else {
-            set_err_fmt(errmsg,"Expected value in INSERT VALUES, got '%s'",v.text);
+            set_err_fmt(errmsg, "Expected value in INSERT VALUES, got '%s'", v.text);
             return -1;
         }
-        Token nx=lexer_peek(lx);
-        if(nx.type==PUNCT_COMMA) lexer_next(lx);
-        else if(nx.type==PUNCT_RPAREN){ lexer_next(lx); break; }
-        else{ set_err_fmt(errmsg,"Expected ',' or ')' in VALUES, got '%s'",nx.text); return -1; }
+        col++;
+        Token nx = lexer_peek(lx);
+        if      (nx.type == PUNCT_COMMA)  lexer_next(lx);
+        else if (nx.type == PUNCT_RPAREN) { lexer_next(lx); break; }
+        else {
+            set_err_fmt(errmsg, "Expected ',' or ')' in VALUES tuple, got '%s'", nx.text);
+            return -1;
+        }
     }
-    if(lexer_peek(lx).type==PUNCT_SEMI) lexer_next(lx);
+    /* All rows must have the same column count */
+    if (row_idx == 0) {
+        p->value_count = col;
+    } else if (col != p->value_count) {
+        set_err_fmt(errmsg,
+            "Batch INSERT tuple %d has %d values, expected %d",
+            row_idx + 1, col, p->value_count);
+        return -1;
+    }
+    return 0;
+}
+
+static int parse_insert(Lexer *lx, QueryNode *out, char **errmsg) {
+    out->type = QUERY_INSERT;
+    InsertParams *p = &out->params.insert;
+    p->value_count     = 0;
+    p->batch_row_count = 0;
+    p->extra_capacity  = 0;
+    p->expiry          = 0;
+    p->extra_rows      = nullptr;
+
+    lexer_next(lx); /* consume INSERT */
+    if (lexer_expect(lx, KW_INTO,   nullptr, errmsg) != 0) return -1;
+    Token tn;
+    if (lexer_expect(lx, TOK_IDENT, &tn,     errmsg) != 0) return -1;
+    strncpy(p->table_name, tn.text, FLEXQL_MAX_NAME_LEN - 1);
+    if (lexer_expect(lx, KW_VALUES, nullptr, errmsg) != 0) return -1;
+
+    /* Parse row 0 (always inline — zero extra allocation) */
+    if (parse_one_tuple(lx, p, 0, errmsg) != 0) return -1;
+    p->batch_row_count = 1;
+
+    /* Peek for more tuples: ',' tuple (',' tuple)*
+     * This is the ONLY grammar change for batch INSERT.                   */
+    while (lexer_peek(lx).type == PUNCT_COMMA) {
+        /* Check next-next token: if '(' it's another tuple, else stop     */
+        lexer_next(lx); /* consume ',' */
+        if (lexer_peek(lx).type != PUNCT_LPAREN) break; /* trailing comma before ';' */
+
+        if (p->batch_row_count >= FLEXQL_MAX_BATCH_ROWS) {
+            set_err_fmt(errmsg, "Batch INSERT exceeds maximum of %d rows",
+                        FLEXQL_MAX_BATCH_ROWS);
+            return -1;
+        }
+
+        /* ── Geometric growth (like std::vector) ──────────────────────────
+         * OLD: realloc by 1 slot each time → O(n²) total memcpy
+         *   batch=1000 → ~7.8 GB of memcpy (the measured bottleneck!)
+         *
+         * NEW: double capacity when full → O(n) total amortised memcpy
+         *   Start at 16 slots, double to 32, 64, 128, 256, 512, 1024...
+         *   batch=1000 → allocates 1024 slots, ~17 MB copied total
+         *
+         * extra_capacity tracks how many slots are allocated.
+         * extra_used = batch_row_count - 1 (rows 1..N-1).              */
+        int extra_used = p->batch_row_count - 1;
+        if (p->extra_rows == nullptr || extra_used >= p->extra_capacity) {
+            int new_cap = (p->extra_capacity == 0) ? 16
+                        : (p->extra_capacity * 2);
+            if (new_cap > FLEXQL_MAX_BATCH_ROWS) new_cap = FLEXQL_MAX_BATCH_ROWS;
+            char (*new_extra)[FLEXQL_MAX_COLUMNS][FLEXQL_MAX_VARCHAR] =
+                (char(*)[FLEXQL_MAX_COLUMNS][FLEXQL_MAX_VARCHAR])
+                realloc(p->extra_rows,
+                        (size_t)new_cap * sizeof(*p->extra_rows));
+            if (!new_extra) {
+                set_err(errmsg, "Out of memory for batch INSERT rows");
+                return -1;
+            }
+            p->extra_rows    = new_extra;
+            p->extra_capacity = new_cap;
+        }
+        /* Zero-init the new slot */
+        memset(p->extra_rows[extra_used], 0, sizeof(*p->extra_rows));
+
+        if (parse_one_tuple(lx, p, p->batch_row_count, errmsg) != 0) return -1;
+        p->batch_row_count++;
+    }
+
+    if (lexer_peek(lx).type == PUNCT_SEMI) lexer_next(lx);
     return 0;
 }
 

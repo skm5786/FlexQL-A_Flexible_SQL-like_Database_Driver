@@ -34,6 +34,7 @@
 #include <sys/select.h>
 #include <sys/types.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include <unistd.h>
 #include <pthread.h>
@@ -41,6 +42,8 @@
 #include "common/types.h"
 #include "parser/parser.h"
 #include "storage/dbmanager.h"
+#include "storage/wal.h"
+#include "expiration/expiration.h"
 
 /* Forward declaration */
 int executor_execute(DatabaseManager *mgr, Database **current_db,
@@ -197,6 +200,22 @@ int main(int argc, char *argv[]) {
 
     dbmgr_init(&g_manager);
 
+    /* ── LESSON 8: Recover persistent data from WAL on startup ────────────
+     *
+     * This replays every WAL file to rebuild the in-memory state.
+     * After this call, all named databases and their tables/rows are
+     * available in RAM exactly as they were before the last shutdown.
+     *
+     * Session databases (_SESSION_*) are never written to WAL so they
+     * are not recovered — they are per-connection ephemeral namespaces.
+     *
+     * Recovery happens BEFORE we accept any client connections, so there
+     * is no race between recovery and incoming queries.                   */
+    wal_recover(&g_manager);
+
+    /* LESSON 9: Start background expiry thread */
+    expiry_start(&g_manager);
+
     signal(SIGINT,  sigint_handler);
     signal(SIGPIPE, SIG_IGN);
 
@@ -233,6 +252,47 @@ int main(int argc, char *argv[]) {
         int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) { if (g_running) perror("accept"); continue; }
 
+        /* ── LESSON 7: TCP socket tuning ────────────────────────────────────
+         *
+         * TCP_NODELAY — disables Nagle's algorithm.
+         *
+         * Nagle's algorithm (RFC 896) was designed to reduce small-packet
+         * overhead on slow WAN links by buffering data until either:
+         *   a) The buffer fills to MSS (≈1460 bytes), OR
+         *   b) An ACK is received for previously sent data
+         *
+         * For our workload this is harmful:
+         *   - Each MSG_OK response is ~9 bytes (header + "1 row inserted.")
+         *   - Nagle holds the response waiting for more data to batch with
+         *   - The client's OS holds its next INSERT waiting for an ACK
+         *   - Result: 40–200ms "delayed ACK" stall per INSERT on macOS
+         *
+         * TCP_NODELAY = 1 forces every send() to go out immediately.
+         * Combined with TCP_NODELAY on the client socket, this eliminates
+         * the Nagle + delayed-ACK deadlock entirely.
+         *
+         * Expected gain on localhost:
+         *   macOS: 2–10× throughput improvement (delayed ACK = 200ms default)
+         *   Linux: 1.2–2× (delayed ACK = 40ms default)
+         *
+         * SO_RCVBUF / SO_SNDBUF — socket kernel buffer sizes.
+         *   Default is 87KB on Linux, 128KB on macOS.
+         *   256KB buffers help when the client sends large batch INSERT
+         *   SQL strings (1000-row batch ≈ 50KB of SQL text) — the kernel
+         *   can buffer the full string in one recv() call rather than
+         *   fragmenting it across multiple smaller reads.
+         *   The server also sends MSG_DONE/MSG_OK replies faster because
+         *   the send buffer can absorb them without blocking.              */
+        int tcp_flag = 1;
+        setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
+                   &tcp_flag, sizeof(tcp_flag));
+
+        int buf_size = 256 * 1024;  /* 256 KB */
+        setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF,
+                   &buf_size, sizeof(buf_size));
+        setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF,
+                   &buf_size, sizeof(buf_size));
+
         ClientContext *ctx = static_cast<ClientContext*>(
                                  calloc(1, sizeof(ClientContext)));
         ctx->client_fd  = client_fd;
@@ -253,6 +313,7 @@ int main(int argc, char *argv[]) {
     }
 
     close(listen_fd);
+    expiry_stop();              /* LESSON 9: stop background thread first */
     dbmgr_destroy(&g_manager);
     printf("[server] Shutdown complete.\n");
     return 0;

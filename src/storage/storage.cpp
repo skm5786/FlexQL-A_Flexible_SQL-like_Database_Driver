@@ -1,28 +1,26 @@
 /**
- * storage.cpp  —  Table & Row Storage Engine  (Lesson 6 — Correctness fixes)
+ * storage.cpp — Table & Row Storage Engine (Lesson 9 — RW Lock integrated)
  *
- * CHANGES FROM LESSON 4/5:
+ * LESSON 9 CHANGES:
+ *   pthread_rwlock_t replaces pthread_mutex_t in Table.lock.
  *
- *   FIX 1 — Row ordering (insertion order):
- *     Old: prepend new row at head → rows come out in REVERSE order
- *     New: append new row at tail  → rows come out in INSERTION order
- *     Required because benchmark asserts exact row order:
- *       {"1|Alice|...", "2|Bob|...", "3|Carol|...", "4|Dave|..."}
- *     Uses the new Table.tail pointer for O(1) append.
+ *   table_scan()  → pthread_rwlock_rdlock / rdunlock
+ *     Multiple reader threads can hold the read lock simultaneously.
+ *     A client doing SELECT does NOT block other clients doing SELECT.
  *
- *   FIX 2 — DECIMAL rendering:
- *     Old: snprintf(buf, bufsz, "%g", d)
- *          → 1893456000.0 renders as "1.89346e+09" (WRONG)
- *     New: if d is a whole number within int64 range → render as integer
- *          → 1893456000.0 renders as "1893456000" (CORRECT)
- *     Benchmark expects "1|Alice|1200|1893456000", not "1|Alice|1200|1.89346e+09".
+ *   row_insert()  → pthread_rwlock_wrlock / wrunlock
+ *     INSERT acquires the exclusive write lock.  All readers wait.
+ *     This is the standard single-writer / multiple-reader pattern.
  *
- *   FIX 3 — table_create initialises tail = nullptr:
- *     Required companion to Fix 1.
+ *   table_create / table_free → init / destroy the rwlock.
  *
- *   FIX 4 — table_free handles tail pointer:
- *     No functional change needed (we walk head→tail via next pointers)
- *     but setting tail = nullptr during free is defensive.
+ * WHY THIS MATTERS:
+ *   Before L9: 10 concurrent SELECTs on the same table run one at a time.
+ *   After L9:  10 concurrent SELECTs run in parallel (read lock is shared).
+ *   Write throughput is unchanged; read throughput scales with client count.
+ *
+ * All other logic (Fix 1 append-order, Fix 2 DECIMAL, index integration)
+ * is unchanged from previous lessons.
  */
 #include <cstring>
 #include <cstdlib>
@@ -46,7 +44,7 @@ static void set_err_fmt(char **e, const char *fmt, ...) {
     free(*e); *e = strdup(buf);
 }
 
-/* ── string_to_cell (unchanged) ──────────────────────────────────────────── */
+/* ── string_to_cell ─────────────────────────────────────────────────────── */
 int string_to_cell(const char *str, ColumnType type,
                    CellValue *out, char **errmsg) {
     memset(out, 0, sizeof(CellValue));
@@ -94,20 +92,7 @@ int string_to_cell(const char *str, ColumnType type,
     }
 }
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * FIX 2 — DECIMAL RENDERING
- *
- * Problem: snprintf "%g" on 1893456000.0 → "1.89346e+09"
- *          Benchmark expects "1893456000"
- *
- * Solution: check if the double is a whole number that fits in int64.
- *   If yes: render as integer with %lld (no decimal point, no exponent).
- *   If no:  fall back to %g for true fractional values like 3.14.
- *
- * Threshold 1e15: beyond this, int64_t cannot represent all doubles
- * exactly (doubles have 53 bits of mantissa = 15-16 significant digits).
- * Keeping within 1e15 ensures the integer cast is lossless.
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* ── cell_to_string ─────────────────────────────────────────────────────── */
 char *cell_to_string(const CellValue *cell, char *buf, size_t bufsz) {
     if (!cell || cell->is_null) {
         strncpy(buf,"NULL",bufsz-1); buf[bufsz-1]='\0'; return buf;
@@ -115,27 +100,14 @@ char *cell_to_string(const CellValue *cell, char *buf, size_t bufsz) {
     switch (cell->type) {
     case COL_TYPE_INT:
         snprintf(buf,bufsz,"%lld",(long long)cell->data.int_val); break;
-
     case COL_TYPE_DECIMAL: {
         double d = cell->data.decimal_val;
-        /*
-         * If d is a whole number (no fractional part) and within the safe
-         * integer range for int64, render it without a decimal point.
-         * This matches how SQLite renders REAL values that are integers.
-         *
-         * Examples:
-         *   1893456000.0 → "1893456000"  (was "1.89346e+09" with %g)
-         *   1200.0       → "1200"        (correct with both)
-         *   3.14         → "3.14"        (falls through to %g)
-         */
-        if (d == floor(d) && d >= -1e15 && d <= 1e15) {
+        if (d == floor(d) && d >= -1e15 && d <= 1e15)
             snprintf(buf, bufsz, "%lld", (long long)d);
-        } else {
+        else
             snprintf(buf, bufsz, "%g", d);
-        }
         break;
     }
-
     case COL_TYPE_VARCHAR:
         strncpy(buf,cell->data.varchar_val?cell->data.varchar_val:"NULL",bufsz-1);
         buf[bufsz-1]='\0'; break;
@@ -149,7 +121,7 @@ char *cell_to_string(const CellValue *cell, char *buf, size_t bufsz) {
     buf[bufsz-1]='\0'; return buf;
 }
 
-/* ── cell_matches_where (unchanged) ──────────────────────────────────────── */
+/* ── cell_matches_where ──────────────────────────────────────────────────── */
 static int cmp_to_bool(int cmp, CompareOp op) {
     switch(op){
     case OP_EQ: return cmp==0; case OP_NEQ: return cmp!=0;
@@ -183,7 +155,7 @@ int cell_matches_where(const CellValue *cell, const WhereClause *where) {
     }
 }
 
-/* ── row_free_contents (unchanged) ──────────────────────────────────────── */
+/* ── row_free_contents ───────────────────────────────────────────────────── */
 void row_free_contents(Row *row) {
     if (!row||!row->cells) return;
     for (int i=0;i<row->col_count;i++)
@@ -194,20 +166,18 @@ void row_free_contents(Row *row) {
     free(row->cells); row->cells=nullptr;
 }
 
-/* ── table_free — clears tail pointer defensively ───────────────────────── */
+/* ── table_free — destroys rwlock ───────────────────────────────────────── */
 void table_free(Table *table) {
     if (!table) return;
     Row *r = table->head;
     while (r) { Row *n=r->next; row_free_contents(r); free(r); r=n; }
-    table->head = nullptr;
-    table->tail = nullptr;          /* FIX 3: clear tail on free             */
-    index_free(table->pk_index);
-    table->pk_index = nullptr;
-    pthread_mutex_destroy(&table->lock);
+    table->head = nullptr; table->tail = nullptr;
+    index_free(table->pk_index); table->pk_index = nullptr;
+    pthread_rwlock_destroy(&table->lock);   /* LESSON 9: destroy rwlock */
     free(table);
 }
 
-/* ── table_find (unchanged) ──────────────────────────────────────────────── */
+/* ── table_find ──────────────────────────────────────────────────────────── */
 Table *table_find(Database *db, const char *name) {
     if (!db||!name) return nullptr;
     pthread_mutex_lock(&db->schema_lock);
@@ -218,7 +188,7 @@ Table *table_find(Database *db, const char *name) {
     return found;
 }
 
-/* ── table_create — initialises tail = nullptr ───────────────────────────── */
+/* ── table_create — initialises rwlock ─────────────────────────────────── */
 Table *table_create(Database *db, const char *name,
                     ColumnDef *cols, int col_count, char **errmsg) {
     if (!db||!name||!cols||col_count<=0) {
@@ -250,21 +220,17 @@ Table *table_create(Database *db, const char *name,
         if (cols[i].constraints&COL_CONSTRAINT_PRIMARY_KEY) t->pk_col=i;
     }
 
-    t->head = nullptr;
-    t->tail = nullptr;             /* FIX 3: initialise tail                 */
-    t->row_count = 0;
-    t->next_row_id = 1;
-    pthread_mutex_init(&t->lock, nullptr);
+    t->head=nullptr; t->tail=nullptr; t->row_count=0; t->next_row_id=1;
+    pthread_rwlock_init(&t->lock, nullptr);   /* LESSON 9: init rwlock */
 
-    t->pk_index = nullptr;
-    if (t->pk_col >= 0) {
-        ColumnType pk_type = t->schema[t->pk_col].type;
-        t->pk_index = index_create(pk_type);
+    t->pk_index=nullptr;
+    if (t->pk_col>=0) {
+        t->pk_index=index_create(t->schema[t->pk_col].type);
         if (!t->pk_index) {
             pthread_mutex_unlock(&db->schema_lock);
-            pthread_mutex_destroy(&t->lock);
+            pthread_rwlock_destroy(&t->lock);
             free(t);
-            set_err(errmsg,"Out of memory creating primary key index");
+            set_err(errmsg,"Out of memory creating pk index");
             return nullptr;
         }
     }
@@ -274,24 +240,7 @@ Table *table_create(Database *db, const char *name,
     return t;
 }
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * FIX 1 — ROW APPEND (insertion order)
- *
- * Old (prepend, O(1)):
- *   row->next = table->head;
- *   table->head = row;
- *   → rows stored newest-first → SELECT returns them newest-first (WRONG)
- *
- * New (append, O(1) with tail pointer):
- *   row->next = nullptr;
- *   if (table->tail) table->tail->next = row;
- *   else             table->head = row;   // first row ever inserted
- *   table->tail = row;
- *   → rows stored oldest-first → SELECT returns insertion order (CORRECT)
- *
- * The tail pointer makes append O(1) — no traversal needed.
- * The only cost vs prepend is one extra pointer write per insert.
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* ── row_insert — acquires WRITE lock ───────────────────────────────────── */
 int row_insert(Table *table,
                const char str_values[][FLEXQL_MAX_VARCHAR],
                int val_count, time_t expiry, char **errmsg) {
@@ -319,17 +268,17 @@ int row_insert(Table *table,
         }
     }
 
-    /* PK duplicate check (O(1) with index, O(n) fallback) */
+    /* PK duplicate check under WRITE lock */
     if (table->pk_col>=0 && !cells[table->pk_col].is_null) {
         const CellValue *npk = &cells[table->pk_col];
-        pthread_mutex_lock(&table->lock);
+        pthread_rwlock_wrlock(&table->lock);    /* LESSON 9: write lock */
         if (table->pk_index) {
             Row *existing = index_get(table->pk_index, npk);
             if (existing) {
                 time_t now = time(nullptr);
                 bool expired = (existing->expiry>0 && existing->expiry<now);
                 if (!expired) {
-                    pthread_mutex_unlock(&table->lock);
+                    pthread_rwlock_unlock(&table->lock);
                     set_err_fmt(errmsg,"Duplicate PRIMARY KEY value in '%s'",
                                 table->schema[table->pk_col].name);
                     for(int i=0;i<table->col_count;i++) if(cells[i].type==COL_TYPE_VARCHAR) free(cells[i].data.varchar_val);
@@ -349,7 +298,7 @@ int row_insert(Table *table,
                 else if (npk->type==COL_TYPE_VARCHAR&&npk->data.varchar_val&&epk->data.varchar_val)
                     dup=(strcmp(npk->data.varchar_val,epk->data.varchar_val)==0);
                 if (dup) {
-                    pthread_mutex_unlock(&table->lock);
+                    pthread_rwlock_unlock(&table->lock);
                     set_err_fmt(errmsg,"Duplicate PRIMARY KEY value in '%s'",
                                 table->schema[table->pk_col].name);
                     for(int i=0;i<table->col_count;i++) if(cells[i].type==COL_TYPE_VARCHAR) free(cells[i].data.varchar_val);
@@ -357,7 +306,7 @@ int row_insert(Table *table,
                 }
             }
         }
-        pthread_mutex_unlock(&table->lock);
+        pthread_rwlock_unlock(&table->lock);
     }
 
     Row *row=(Row*)calloc(1,sizeof(Row));
@@ -365,32 +314,21 @@ int row_insert(Table *table,
         for(int i=0;i<table->col_count;i++) if(cells[i].type==COL_TYPE_VARCHAR) free(cells[i].data.varchar_val);
         free(cells); set_err(errmsg,"Out of memory"); return -1;
     }
-    row->cells=cells; row->col_count=table->col_count; row->expiry=expiry;
-    row->next=nullptr;
+    row->cells=cells; row->col_count=table->col_count; row->expiry=expiry; row->next=nullptr;
 
-    /* ── FIX 1: APPEND to tail (insertion order) ─────────────────────────
-     * Before: row->next = table->head; table->head = row;  (PREPEND)
-     * After:  link new row after current tail               (APPEND)
-     * Both are O(1). The difference is traversal order.     */
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_wrlock(&table->lock);        /* LESSON 9: write lock for append */
     row->row_id = table->next_row_id++;
-
-    if (table->tail) {
-        table->tail->next = row;   /* link previous last row → new row      */
-    } else {
-        table->head = row;         /* first row: head and tail point to same */
-    }
-    table->tail = row;             /* new row is now the last row            */
+    if (table->tail) { table->tail->next = row; }
+    else             { table->head = row; }
+    table->tail = row;
     table->row_count++;
-
     if (table->pk_index && table->pk_col>=0 && !row->cells[table->pk_col].is_null)
         index_put(table->pk_index, &row->cells[table->pk_col], row);
-
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
     return 0;
 }
 
-/* ── table_scan (unchanged — walks head→tail which is now insertion order) */
+/* ── table_scan — acquires READ lock (shared, concurrent) ───────────────── */
 int table_scan(Table *table, const WhereClause *where,
                ScanCallback cb, void *arg) {
     if (!table||!cb) return 0;
@@ -406,43 +344,36 @@ int table_scan(Table *table, const WhereClause *where,
     }
 
     /* Index fast-path: O(1) for WHERE pk = value */
-    if (wcol >= 0 &&
-        wcol == table->pk_col &&
-        where->op == OP_EQ &&
-        table->pk_index != nullptr) {
-
-        CellValue lookup_key{};
-        char *dummy_err = nullptr;
-        if (string_to_cell(where->value,
-                           table->schema[table->pk_col].type,
-                           &lookup_key, &dummy_err) == 0) {
-            pthread_mutex_lock(&table->lock);
-            Row *found = index_get(table->pk_index, &lookup_key);
-            int visited = 0;
+    if (wcol>=0 && wcol==table->pk_col && where->op==OP_EQ && table->pk_index) {
+        CellValue lookup_key{}; char *derr=nullptr;
+        if (string_to_cell(where->value, table->schema[table->pk_col].type,
+                           &lookup_key, &derr)==0) {
+            pthread_rwlock_rdlock(&table->lock);   /* LESSON 9: read lock */
+            Row *found=index_get(table->pk_index,&lookup_key);
+            int visited=0;
             if (found) {
-                time_t now = time(nullptr);
-                bool live = !(found->expiry > 0 && found->expiry < now);
-                if (live) { visited = 1; cb(found, arg); }
+                time_t now=time(nullptr);
+                if (!(found->expiry>0&&found->expiry<now)) { visited=1; cb(found,arg); }
             }
-            pthread_mutex_unlock(&table->lock);
-            if (lookup_key.type==COL_TYPE_VARCHAR && lookup_key.data.varchar_val)
+            pthread_rwlock_unlock(&table->lock);
+            if (lookup_key.type==COL_TYPE_VARCHAR&&lookup_key.data.varchar_val)
                 free(lookup_key.data.varchar_val);
-            free(dummy_err);
+            free(derr);
             return visited;
         }
-        free(dummy_err);
+        free(derr);
     }
 
-    /* Full table scan — walks head→tail (insertion order after Fix 1) */
+    /* Full scan — shared read lock: multiple clients can scan simultaneously */
     time_t now=time(nullptr);
     int    visited=0;
-    pthread_mutex_lock(&table->lock);
+    pthread_rwlock_rdlock(&table->lock);           /* LESSON 9: read lock */
     for (Row *r=table->head;r;r=r->next) {
         if (r->expiry>0&&r->expiry<now) continue;
         if (wcol>=0&&!cell_matches_where(&r->cells[wcol],where)) continue;
         visited++;
         if (cb(r,arg)) break;
     }
-    pthread_mutex_unlock(&table->lock);
+    pthread_rwlock_unlock(&table->lock);
     return visited;
 }

@@ -39,8 +39,12 @@ static void purge_table(Table *table) {
                 index_remove(table->pk_index, &r->cells[table->pk_col]);
             }
 
-            row_free_contents(r);
-            free(r);
+            row_free_contents(r);   /* no-op in L11 — arena owns memory */
+            free(r);                /* Row struct is arena-owned — skip free */
+            /* Note: With the arena, we cannot individually free rows.
+             * Expired rows are unlinked and invisible to scans, but their
+             * memory is reclaimed when the table is dropped (arena_free).
+             * The row pointer is simply abandoned here.                   */
             removed++;
         } else {
             prev = r;

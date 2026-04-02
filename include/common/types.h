@@ -138,42 +138,48 @@ typedef struct Row {
     struct Row *next;                      /* Intrusive linked-list for table  */
 } Row;
 
-/* Forward declaration — HashIndex is defined in include/index/index.h.
- * We use a pointer here so types.h does not need to include index.h,
- * keeping the dependency graph clean (storage.h includes index.h).        */
+/* Forward declaration — HashIndex is defined in include/index/index.h.    */
 #ifndef FLEXQL_INDEX_FORWARD_DECL
 #define FLEXQL_INDEX_FORWARD_DECL
 typedef struct HashIndex HashIndex;
 #endif
 
+/* Forward declarations for Lesson 10 (BTree) and Lesson 11 (Arena).      */
+#ifndef FLEXQL_BTREE_FORWARD_DECL
+#define FLEXQL_BTREE_FORWARD_DECL
+typedef struct BTree BTree;
+#endif
+#ifndef FLEXQL_ARENA_FORWARD_DECL
+#define FLEXQL_ARENA_FORWARD_DECL
+typedef struct Arena Arena;
+#endif
+
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
  *  TABLE  (one relation in the database)
  *
- *  Lesson 4: pk_index — HashIndex for O(1) PK lookup and dupe check.
- *
- *  Lesson 6 adds tail:
- *    tail — pointer to the LAST row in the linked list.
- *           Enables O(1) append so rows are stored in INSERTION ORDER.
- *
- *  WHY insertion order matters:
- *    The benchmark test asserts exact row ordering:
- *      {"1|Alice|...", "2|Bob|...", "3|Carol|...", "4|Dave|..."}
- *    Prepend (the old approach) gave reverse order.
- *    Append gives insertion order — correct for SQL semantics.
- *    Cost: one extra pointer assignment per insert (negligible).
+ *  Lesson 4:  pk_index — HashIndex for O(1) PK lookup and dupe check.
+ *  Lesson 6:  tail     — O(1) append for insertion order.
+ *  Lesson 9:  lock     — RWLock for concurrent readers.
+ *  Lesson 10: col_btree[FLEXQL_MAX_COLUMNS] — per-column B+ tree range index.
+ *             Only created for INT/DECIMAL columns; NULL for others.
+ *  Lesson 11: row_arena — bump allocator for Row + CellValue memory.
+ *             All Row/CellValue memory is from the arena; table_free()
+ *             drops the whole arena instead of iterating the list.
  * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
 typedef struct Table {
-    char            name[FLEXQL_MAX_NAME_LEN]; /* Table name (upper-cased)  */
-    ColumnDef       schema[FLEXQL_MAX_COLUMNS];/* Column definitions         */
-    int             col_count;                 /* Number of columns          */
-    int             pk_col;                    /* PRIMARY KEY column idx, -1 */
-    Row            *head;                      /* First row (oldest)         */
-    Row            *tail;                      /* Last row (newest) — L6     */
-    uint64_t        row_count;                 /* Live (non-expired) rows    */
-    uint64_t        next_row_id;               /* Monotonic insert counter   */
-    pthread_rwlock_t lock;  /* RW lock: readers share, writer exclusive (L9) */
-    struct HashIndex *pk_index;                /* PK hash index, or NULL     */
-    struct Table    *next;                     /* Unused (reserved)          */
+    char            name[FLEXQL_MAX_NAME_LEN];
+    ColumnDef       schema[FLEXQL_MAX_COLUMNS];
+    int             col_count;
+    int             pk_col;
+    Row            *head;
+    Row            *tail;
+    uint64_t        row_count;
+    uint64_t        next_row_id;
+    pthread_rwlock_t lock;
+    struct HashIndex *pk_index;
+    BTree           *col_btree[FLEXQL_MAX_COLUMNS]; /* L10: one B+tree per col */
+    Arena           *row_arena;                     /* L11: bump allocator     */
+    struct Table    *next;
 } Table;
 
 /* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━

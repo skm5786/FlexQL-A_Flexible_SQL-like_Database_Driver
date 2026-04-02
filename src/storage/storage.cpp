@@ -1,26 +1,24 @@
 /**
- * storage.cpp — Table & Row Storage Engine (Lesson 9 — RW Lock integrated)
+ * storage.cpp  —  Table & Row Storage Engine  (Lessons 10+11 integrated)
  *
- * LESSON 9 CHANGES:
- *   pthread_rwlock_t replaces pthread_mutex_t in Table.lock.
+ * LESSON 10 — B+ TREE RANGE INDEX:
+ *   table_create()  allocates a BTree for every INT/DECIMAL column.
+ *   row_insert()    calls btree_insert() for every non-null cell value.
+ *   table_scan()    uses btree_range_scan() when the WHERE uses >, <, >=, <=
+ *                   on a column that has a B+ tree.
+ *   table_free()    calls btree_free() for each column tree.
  *
- *   table_scan()  → pthread_rwlock_rdlock / rdunlock
- *     Multiple reader threads can hold the read lock simultaneously.
- *     A client doing SELECT does NOT block other clients doing SELECT.
+ * LESSON 11 — ARENA ALLOCATOR:
+ *   table_create()  allocates one Arena per table.
+ *   row_insert()    uses arena_alloc() for Row struct and CellValue array.
+ *                   VARCHAR strings also use arena_alloc_str().
+ *   row_free_contents() is now a no-op — arena owns all row memory.
+ *   table_free()    calls arena_free() once to release all row memory.
+ *                   No more per-row free() loop.
  *
- *   row_insert()  → pthread_rwlock_wrlock / wrunlock
- *     INSERT acquires the exclusive write lock.  All readers wait.
- *     This is the standard single-writer / multiple-reader pattern.
- *
- *   table_create / table_free → init / destroy the rwlock.
- *
- * WHY THIS MATTERS:
- *   Before L9: 10 concurrent SELECTs on the same table run one at a time.
- *   After L9:  10 concurrent SELECTs run in parallel (read lock is shared).
- *   Write throughput is unchanged; read throughput scales with client count.
- *
- * All other logic (Fix 1 append-order, Fix 2 DECIMAL, index integration)
- * is unchanged from previous lessons.
+ *   WHY this is faster:
+ *     Old: 2M+ malloc() + free() calls for 1M rows (slow, lock contention)
+ *     New: N slab allocations (N << M) + 1 arena_free() at drop time
  */
 #include <cstring>
 #include <cstdlib>
@@ -32,7 +30,9 @@
 #include <cmath>
 #include <strings.h>
 #include "storage/storage.h"
+#include "storage/arena.h"
 #include "index/index.h"
+#include "index/btree.h"
 
 static void set_err(char **e, const char *msg) {
     if (!e) return; free(*e); *e = strdup(msg);
@@ -44,7 +44,7 @@ static void set_err_fmt(char **e, const char *fmt, ...) {
     free(*e); *e = strdup(buf);
 }
 
-/* ── string_to_cell ─────────────────────────────────────────────────────── */
+/* ── string_to_cell (unchanged) ──────────────────────────────────────────── */
 int string_to_cell(const char *str, ColumnType type,
                    CellValue *out, char **errmsg) {
     memset(out, 0, sizeof(CellValue));
@@ -92,7 +92,7 @@ int string_to_cell(const char *str, ColumnType type,
     }
 }
 
-/* ── cell_to_string ─────────────────────────────────────────────────────── */
+/* ── cell_to_string (unchanged) ──────────────────────────────────────────── */
 char *cell_to_string(const CellValue *cell, char *buf, size_t bufsz) {
     if (!cell || cell->is_null) {
         strncpy(buf,"NULL",bufsz-1); buf[bufsz-1]='\0'; return buf;
@@ -121,7 +121,7 @@ char *cell_to_string(const CellValue *cell, char *buf, size_t bufsz) {
     buf[bufsz-1]='\0'; return buf;
 }
 
-/* ── cell_matches_where ──────────────────────────────────────────────────── */
+/* ── cell_matches_where (unchanged) ──────────────────────────────────────── */
 static int cmp_to_bool(int cmp, CompareOp op) {
     switch(op){
     case OP_EQ: return cmp==0; case OP_NEQ: return cmp!=0;
@@ -155,29 +155,38 @@ int cell_matches_where(const CellValue *cell, const WhereClause *where) {
     }
 }
 
-/* ── row_free_contents ───────────────────────────────────────────────────── */
+/* ── LESSON 11: row_free_contents is now a no-op ────────────────────────────
+ * Arena owns all Row + CellValue memory.
+ * VARCHAR strings are also arena-allocated — no individual free needed.
+ * The function is kept for API compatibility (expiration.cpp calls it).     */
 void row_free_contents(Row *row) {
-    if (!row||!row->cells) return;
-    for (int i=0;i<row->col_count;i++)
-        if (row->cells[i].type==COL_TYPE_VARCHAR && row->cells[i].data.varchar_val) {
-            free(row->cells[i].data.varchar_val);
-            row->cells[i].data.varchar_val=nullptr;
-        }
-    free(row->cells); row->cells=nullptr;
+    (void)row;
+    /* All row memory is owned by table->row_arena.
+       arena_free() in table_free() releases everything at once.             */
 }
 
-/* ── table_free — destroys rwlock ───────────────────────────────────────── */
+/* ── table_free — LESSON 11: drops entire arena ─────────────────────────── */
 void table_free(Table *table) {
     if (!table) return;
-    Row *r = table->head;
-    while (r) { Row *n=r->next; row_free_contents(r); free(r); r=n; }
-    table->head = nullptr; table->tail = nullptr;
-    index_free(table->pk_index); table->pk_index = nullptr;
-    pthread_rwlock_destroy(&table->lock);   /* LESSON 9: destroy rwlock */
+    /* LESSON 11: free all row memory in one call */
+    arena_free(table->row_arena);
+    table->row_arena = nullptr;
+    table->head = nullptr;
+    table->tail = nullptr;
+
+    /* LESSON 10: free all column B+ trees */
+    for (int i = 0; i < FLEXQL_MAX_COLUMNS; i++) {
+        btree_free(table->col_btree[i]);
+        table->col_btree[i] = nullptr;
+    }
+
+    index_free(table->pk_index);
+    table->pk_index = nullptr;
+    pthread_rwlock_destroy(&table->lock);
     free(table);
 }
 
-/* ── table_find ──────────────────────────────────────────────────────────── */
+/* ── table_find (unchanged) ──────────────────────────────────────────────── */
 Table *table_find(Database *db, const char *name) {
     if (!db||!name) return nullptr;
     pthread_mutex_lock(&db->schema_lock);
@@ -188,7 +197,7 @@ Table *table_find(Database *db, const char *name) {
     return found;
 }
 
-/* ── table_create — initialises rwlock ─────────────────────────────────── */
+/* ── table_create — LESSONS 10+11: allocate btrees + arena ─────────────── */
 Table *table_create(Database *db, const char *name,
                     ColumnDef *cols, int col_count, char **errmsg) {
     if (!db||!name||!cols||col_count<=0) {
@@ -208,7 +217,7 @@ Table *table_create(Database *db, const char *name,
     }
 
     Table *t=(Table*)calloc(1,sizeof(Table));
-    if (!t) { pthread_mutex_unlock(&db->schema_lock); set_err(errmsg,"Out of memory"); return nullptr; }
+    if (!t) { pthread_mutex_unlock(&db->schema_lock); set_err(errmsg,"OOM"); return nullptr; }
 
     strncpy(t->name,name,FLEXQL_MAX_NAME_LEN-1);
     for (char *p=t->name;*p;p++) *p=(char)toupper((unsigned char)*p);
@@ -221,17 +230,33 @@ Table *table_create(Database *db, const char *name,
     }
 
     t->head=nullptr; t->tail=nullptr; t->row_count=0; t->next_row_id=1;
-    pthread_rwlock_init(&t->lock, nullptr);   /* LESSON 9: init rwlock */
+    pthread_rwlock_init(&t->lock,nullptr);
 
+    /* LESSON 11: create arena for row memory */
+    t->row_arena = arena_create();
+    if (!t->row_arena) {
+        pthread_mutex_unlock(&db->schema_lock);
+        pthread_rwlock_destroy(&t->lock); free(t);
+        set_err(errmsg,"OOM creating row arena"); return nullptr;
+    }
+
+    /* LESSON 4: hash index for primary key */
     t->pk_index=nullptr;
     if (t->pk_col>=0) {
         t->pk_index=index_create(t->schema[t->pk_col].type);
         if (!t->pk_index) {
             pthread_mutex_unlock(&db->schema_lock);
-            pthread_rwlock_destroy(&t->lock);
-            free(t);
-            set_err(errmsg,"Out of memory creating pk index");
-            return nullptr;
+            arena_free(t->row_arena); pthread_rwlock_destroy(&t->lock); free(t);
+            set_err(errmsg,"OOM creating pk index"); return nullptr;
+        }
+    }
+
+    /* LESSON 10: B+ tree for every INT/DECIMAL column */
+    for (int i=0;i<col_count;i++) {
+        ColumnType ct = t->schema[i].type;
+        if (ct==COL_TYPE_INT || ct==COL_TYPE_DECIMAL || ct==COL_TYPE_DATETIME) {
+            t->col_btree[i] = btree_create(ct);
+            /* OOM on btree is non-fatal — fall back to full scan */
         }
     }
 
@@ -240,7 +265,7 @@ Table *table_create(Database *db, const char *name,
     return t;
 }
 
-/* ── row_insert — acquires WRITE lock ───────────────────────────────────── */
+/* ── row_insert — LESSONS 10+11: arena alloc + btree insert ─────────────── */
 int row_insert(Table *table,
                const char str_values[][FLEXQL_MAX_VARCHAR],
                int val_count, time_t expiry, char **errmsg) {
@@ -251,40 +276,49 @@ int row_insert(Table *table,
         return -1;
     }
 
-    CellValue *cells=(CellValue*)calloc(table->col_count,sizeof(CellValue));
-    if (!cells) { set_err(errmsg,"Out of memory"); return -1; }
+    /* LESSON 11: Allocate cells from arena (no individual free needed) */
+    CellValue *cells = (CellValue*)arena_alloc(table->row_arena,
+                                               table->col_count * sizeof(CellValue));
+    if (!cells) { set_err(errmsg,"OOM: arena full"); return -1; }
 
     for (int i=0;i<table->col_count;i++) {
         const ColumnDef *col=&table->schema[i];
         const char      *sv =str_values[i];
         if ((col->constraints&COL_CONSTRAINT_NOT_NULL)&&sv[0]=='\0') {
             set_err_fmt(errmsg,"Column '%s' cannot be NULL",col->name);
-            for(int j=0;j<i;j++) if(cells[j].type==COL_TYPE_VARCHAR) free(cells[j].data.varchar_val);
-            free(cells); return -1;
+            /* Arena: no cleanup needed — arena will reclaim at table drop  */
+            return -1;
         }
-        if (string_to_cell(sv,col->type,&cells[i],errmsg)!=0) {
-            for(int j=0;j<i;j++) if(cells[j].type==COL_TYPE_VARCHAR) free(cells[j].data.varchar_val);
-            free(cells); return -1;
+        /* Use a temporary CellValue to convert, then fix up VARCHAR */
+        CellValue tmp{}; char *cerr=nullptr;
+        if (string_to_cell(sv,col->type,&tmp,&cerr)!=0) {
+            if (errmsg) { free(*errmsg); *errmsg=cerr; } else free(cerr);
+            return -1;
+        }
+        cells[i] = tmp;
+        /* LESSON 11: For VARCHAR, re-allocate the string from arena */
+        if (col->type==COL_TYPE_VARCHAR && tmp.data.varchar_val) {
+            cells[i].data.varchar_val =
+                arena_alloc_str(table->row_arena, tmp.data.varchar_val);
+            free(tmp.data.varchar_val); /* free the strdup from string_to_cell */
         }
     }
 
-    /* PK duplicate check under WRITE lock */
+    /* PK duplicate check under write lock */
     if (table->pk_col>=0 && !cells[table->pk_col].is_null) {
         const CellValue *npk = &cells[table->pk_col];
-        pthread_rwlock_wrlock(&table->lock);    /* LESSON 9: write lock */
+        pthread_rwlock_wrlock(&table->lock);
         if (table->pk_index) {
-            Row *existing = index_get(table->pk_index, npk);
+            Row *existing=index_get(table->pk_index,npk);
             if (existing) {
-                time_t now = time(nullptr);
-                bool expired = (existing->expiry>0 && existing->expiry<now);
-                if (!expired) {
+                time_t now=time(nullptr);
+                if (!(existing->expiry>0&&existing->expiry<now)) {
                     pthread_rwlock_unlock(&table->lock);
-                    set_err_fmt(errmsg,"Duplicate PRIMARY KEY value in '%s'",
+                    set_err_fmt(errmsg,"Duplicate PRIMARY KEY in '%s'",
                                 table->schema[table->pk_col].name);
-                    for(int i=0;i<table->col_count;i++) if(cells[i].type==COL_TYPE_VARCHAR) free(cells[i].data.varchar_val);
-                    free(cells); return -1;
+                    return -1;
                 }
-                index_remove(table->pk_index, npk);
+                index_remove(table->pk_index,npk);
             }
         } else {
             time_t now=time(nullptr);
@@ -299,36 +333,40 @@ int row_insert(Table *table,
                     dup=(strcmp(npk->data.varchar_val,epk->data.varchar_val)==0);
                 if (dup) {
                     pthread_rwlock_unlock(&table->lock);
-                    set_err_fmt(errmsg,"Duplicate PRIMARY KEY value in '%s'",
+                    set_err_fmt(errmsg,"Duplicate PRIMARY KEY in '%s'",
                                 table->schema[table->pk_col].name);
-                    for(int i=0;i<table->col_count;i++) if(cells[i].type==COL_TYPE_VARCHAR) free(cells[i].data.varchar_val);
-                    free(cells); return -1;
+                    return -1;
                 }
             }
         }
         pthread_rwlock_unlock(&table->lock);
     }
 
-    Row *row=(Row*)calloc(1,sizeof(Row));
-    if (!row) {
-        for(int i=0;i<table->col_count;i++) if(cells[i].type==COL_TYPE_VARCHAR) free(cells[i].data.varchar_val);
-        free(cells); set_err(errmsg,"Out of memory"); return -1;
-    }
+    /* LESSON 11: Allocate Row struct from arena */
+    Row *row=(Row*)arena_alloc(table->row_arena, sizeof(Row));
+    if (!row) { set_err(errmsg,"OOM: arena full"); return -1; }
     row->cells=cells; row->col_count=table->col_count; row->expiry=expiry; row->next=nullptr;
 
-    pthread_rwlock_wrlock(&table->lock);        /* LESSON 9: write lock for append */
+    pthread_rwlock_wrlock(&table->lock);
     row->row_id = table->next_row_id++;
-    if (table->tail) { table->tail->next = row; }
-    else             { table->head = row; }
-    table->tail = row;
+    if (table->tail) table->tail->next=row; else table->head=row;
+    table->tail=row;
     table->row_count++;
+
     if (table->pk_index && table->pk_col>=0 && !row->cells[table->pk_col].is_null)
         index_put(table->pk_index, &row->cells[table->pk_col], row);
+
+    /* LESSON 10: Insert into B+ tree for every indexed column */
+    for (int i=0;i<table->col_count;i++) {
+        if (table->col_btree[i] && !row->cells[i].is_null)
+            btree_insert(table->col_btree[i], &row->cells[i], row);
+    }
+
     pthread_rwlock_unlock(&table->lock);
     return 0;
 }
 
-/* ── table_scan — acquires READ lock (shared, concurrent) ───────────────── */
+/* ── table_scan — LESSON 10: B+tree fast path for range queries ──────────── */
 int table_scan(Table *table, const WhereClause *where,
                ScanCallback cb, void *arg) {
     if (!table||!cb) return 0;
@@ -343,31 +381,75 @@ int table_scan(Table *table, const WhereClause *where,
         if (wcol<0) return 0;
     }
 
-    /* Index fast-path: O(1) for WHERE pk = value */
+    /* LESSON 4: Hash index fast-path for WHERE pk = value */
     if (wcol>=0 && wcol==table->pk_col && where->op==OP_EQ && table->pk_index) {
-        CellValue lookup_key{}; char *derr=nullptr;
-        if (string_to_cell(where->value, table->schema[table->pk_col].type,
-                           &lookup_key, &derr)==0) {
-            pthread_rwlock_rdlock(&table->lock);   /* LESSON 9: read lock */
-            Row *found=index_get(table->pk_index,&lookup_key);
+        CellValue lk{}; char *derr=nullptr;
+        if (string_to_cell(where->value,table->schema[table->pk_col].type,&lk,&derr)==0) {
+            pthread_rwlock_rdlock(&table->lock);
+            Row *found=index_get(table->pk_index,&lk);
             int visited=0;
             if (found) {
                 time_t now=time(nullptr);
                 if (!(found->expiry>0&&found->expiry<now)) { visited=1; cb(found,arg); }
             }
             pthread_rwlock_unlock(&table->lock);
-            if (lookup_key.type==COL_TYPE_VARCHAR&&lookup_key.data.varchar_val)
-                free(lookup_key.data.varchar_val);
+            if (lk.type==COL_TYPE_VARCHAR&&lk.data.varchar_val) free(lk.data.varchar_val);
             free(derr);
             return visited;
         }
         free(derr);
     }
 
-    /* Full scan — shared read lock: multiple clients can scan simultaneously */
-    time_t now=time(nullptr);
-    int    visited=0;
-    pthread_rwlock_rdlock(&table->lock);           /* LESSON 9: read lock */
+    /* LESSON 10: B+ tree fast-path for range queries (>, <, >=, <=)
+     *
+     * Condition: WHERE clause uses a range operator AND the column has a
+     * B+ tree index.  We do NOT use the B+ tree for EQ (hash index is
+     * faster) or for columns without a btree (VARCHAR, or alloc failure).
+     *
+     * For WHERE col > X:
+     *   lo = X (exclusive), hi = NULL (unbounded)
+     *   btree_range_scan walks leaves from the first key > X to the end.
+     *
+     * For WHERE col BETWEEN X AND Y  (future — parsed as two conditions):
+     *   lo = X, hi = Y with appropriate operators.                        */
+    if (wcol>=0 &&
+        table->col_btree[wcol] != nullptr &&
+        where->op != OP_EQ && where->op != OP_NEQ) {
+
+        /* Build CellValue from the WHERE value string */
+        CellValue bound{}; char *derr=nullptr;
+        ColumnType ct = table->schema[wcol].type;
+        if (string_to_cell(where->value, ct, &bound, &derr) == 0 && !bound.is_null) {
+            free(derr);
+
+            /* Determine lo/hi based on operator */
+            const CellValue *lo = nullptr, *hi = nullptr;
+            CompareOp lo_op = OP_GT, hi_op = OP_LT;
+
+            pthread_rwlock_rdlock(&table->lock);
+            int visited = 0;
+            if (where->op == OP_GT || where->op == OP_GTE) {
+                lo = &bound; lo_op = where->op;
+                visited = btree_range_scan(table->col_btree[wcol],
+                                           lo, lo_op, nullptr, OP_LT, cb, arg);
+            } else { /* OP_LT, OP_LTE */
+                hi = &bound; hi_op = where->op;
+                visited = btree_range_scan(table->col_btree[wcol],
+                                           nullptr, OP_GT, hi, hi_op, cb, arg);
+            }
+            pthread_rwlock_unlock(&table->lock);
+            if (bound.type==COL_TYPE_VARCHAR&&bound.data.varchar_val)
+                free(bound.data.varchar_val);
+            return visited;
+        }
+        free(derr);
+        if (bound.type==COL_TYPE_VARCHAR&&bound.data.varchar_val)
+            free(bound.data.varchar_val);
+    }
+
+    /* Full scan (fallback) */
+    time_t now=time(nullptr); int visited=0;
+    pthread_rwlock_rdlock(&table->lock);
     for (Row *r=table->head;r;r=r->next) {
         if (r->expiry>0&&r->expiry<now) continue;
         if (wcol>=0&&!cell_matches_where(&r->cells[wcol],where)) continue;

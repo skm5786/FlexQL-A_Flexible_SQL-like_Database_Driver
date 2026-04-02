@@ -40,7 +40,9 @@ SERVER_SRCS := src/server/server.cpp \
                src/storage/dbmanager.cpp \
                src/storage/storage.cpp \
                src/storage/wal.cpp \
+               src/storage/arena.cpp \
                src/index/index.cpp \
+               src/index/btree.cpp \
                src/cache/cache.cpp \
                src/expiration/expiration.cpp \
                src/network/network.cpp

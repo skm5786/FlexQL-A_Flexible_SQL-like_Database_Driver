@@ -1,12 +1,27 @@
 /**
- * network.cpp  —  Query Executor  (Lesson 5 — Cache integrated)
+ * network.cpp  —  Query Executor  (Perf-optimized)
  *
- * Changes from Lesson 3/4:
- *   SELECT      → check cache first; on miss scan + store; on hit replay
- *   INNER JOIN  → check cache first; same pattern
- *   INSERT      → invalidate cache entries for the affected table
- *   DROP TABLE  → invalidate cache entries for that table
- *   DROP DB     → invalidate all cache entries for that database
+ * PERFORMANCE CHANGES vs Lesson 5 version:
+ *
+ *   1. ELIMINATED malloc() IN THE INSERT HOT PATH
+ *      The original code did:
+ *        const char **flat = malloc(batch_row_count * value_count * sizeof(char*));
+ *        ...wal_write_insert_batch(flat)...
+ *        free(flat);
+ *      For the benchmark with INSERT_BATCH_SIZE=1, this is one malloc+free
+ *      per INSERT row — 10M malloc/free pairs for a 10M-row benchmark.
+ *      Each malloc/free pair costs ~50–200ns plus allocator lock contention
+ *      under multiple concurrent clients.
+ *
+ *      Fix: use a stack-allocated array for single-row inserts (the common
+ *      case from the benchmark).  Only heap-allocate for large batches.
+ *
+ *   2. STACK-ALLOCATED flat array for WAL batch writes
+ *      FLEXQL_MAX_COLUMNS is 64, so the stack array is 64 pointers = 512 bytes.
+ *      Well within stack limits.  Heap path is kept for batch_row_count > 1
+ *      where the array would be batch_row_count * value_count pointers.
+ *
+ *   3. No other logic changes — all correctness paths identical to original.
  */
 #include <cstring>
 #include <cstdlib>
@@ -23,7 +38,7 @@
 #include "storage/wal.h"
 #include "cache/cache.h"
 
-/* ── Wire helpers (unchanged) ────────────────────────────────────────────── */
+/* ── Wire helpers ────────────────────────────────────────────────────────── */
 static int _send_all(int fd, const void *buf, size_t len) {
     const char *p=(const char*)buf; size_t rem=len;
     while(rem>0){ssize_t n=send(fd,p,rem,MSG_NOSIGNAL);if(n<=0)return -1;p+=n;rem-=(size_t)n;}
@@ -38,9 +53,7 @@ static int _send_msg(int fd, MessageType type, const char *payload, uint32_t ple
 static void send_ok(int fd,const char *msg){_send_msg(fd,MSG_OK,msg,(uint32_t)strlen(msg));}
 static void send_err(int fd,const char *msg){_send_msg(fd,MSG_ERROR,msg,(uint32_t)strlen(msg));}
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * RESULT ROW SERIALISATION (unchanged from Lesson 3)
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* ── Result row serialisation (unchanged) ──────────────────────────────── */
 static int send_result_row(int fd, int col_count,
                             const char **col_names, const char **col_values) {
     uint32_t total=sizeof(uint32_t);
@@ -62,21 +75,7 @@ static int send_result_row(int fd, int col_count,
     free(payload); return rc;
 }
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * LESSON 5 — CACHE-AWARE RESULT BUILDING
- *
- * When we do a SELECT scan, instead of sending each row directly to the
- * client socket, we ALSO capture every serialised payload into a dynamic
- * array.  After the scan completes, we:
- *   1. Store the array in the cache (keyed by db_name + sql).
- *   2. The payloads have already been sent to the client during scan,
- *      so no extra copy is needed for this request.
- *
- * On the NEXT identical SELECT, cache_get() returns the stored payloads
- * and we loop through them sending each directly — zero storage access.
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
-
-/* Dynamic array to accumulate serialised row payloads during a scan */
+/* ── Cache-aware payload buffer ─────────────────────────────────────────── */
 struct PayloadBuffer {
     char    **bufs;
     uint32_t *lens;
@@ -109,7 +108,6 @@ static int pb_append(PayloadBuffer *pb, const char *data, uint32_t len) {
     return 0;
 }
 
-/* Build and send one result row, also storing it in the payload buffer */
 static int emit_and_capture(int fd, const Table *table,
                              const SelectList *sel, const Row *row,
                              PayloadBuffer *pb) {
@@ -138,7 +136,6 @@ static int emit_and_capture(int fd, const Table *table,
         values[i]=cell_to_string(&row->cells[ci],vbufs[i],sizeof(vbufs[i]));
     }
 
-    /* Build the serialised payload */
     uint32_t total=sizeof(uint32_t);
     for(int i=0;i<ncols;i++){
         total+=sizeof(uint32_t)+(uint32_t)strlen(names[i]);
@@ -154,17 +151,12 @@ static int emit_and_capture(int fd, const Table *table,
         memcpy(pp,&vl_n,4);pp+=4;if(vl>0){memcpy(pp,values[i],vl);pp+=vl;}
     }
 
-    /* Send to client */
     _send_msg(fd, MSG_RESULT, payload, total);
-
-    /* Store in buffer for later caching */
     if(pb) pb_append(pb, payload, total);
-
     free(payload);
     return 0;
 }
 
-/* Scan callback context for SELECT with caching */
 struct ScanCtx {
     int client_fd;
     const Table *table;
@@ -178,9 +170,7 @@ static int select_cb(const Row *row, void *arg) {
     ctx->rows_sent++; return 0;
 }
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * INNER JOIN (unchanged logic, cache-aware wrapper added)
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* ── Inner join (unchanged) ─────────────────────────────────────────────── */
 struct JoinCtx {
     int client_fd;
     const Table *outer_table, *inner_table;
@@ -221,7 +211,6 @@ static int inner_join_inner_cb(const Row *inner_row, void *arg) {
         names[oc+i]=nbufs[oc+i]; values[oc+i]=cell_to_string(&inner_row->cells[i],vbufs[oc+i],sizeof(vbufs[oc+i]));
     }
 
-    /* Build payload, send, capture */
     uint32_t total=sizeof(uint32_t);
     for(int i=0;i<tot;i++){
         total+=sizeof(uint32_t)+(uint32_t)strlen(names[i]);
@@ -249,9 +238,7 @@ static int inner_join_outer_cb(const Row *outer_row, void *arg) {
     return 0;
 }
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * DB-LEVEL HELPERS (SHOW DATABASES / SHOW TABLES)
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* ── DB-level helpers ────────────────────────────────────────────────────── */
 static void send_single_col_rows(int fd, const char *col_label,
                                   const char names[][FLEXQL_MAX_NAME_LEN], int n) {
     for(int i=0;i<n;i++){
@@ -261,9 +248,7 @@ static void send_single_col_rows(int fd, const char *col_label,
     _send_msg(fd,MSG_DONE,nullptr,0);
 }
 
-/* ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
- * MAIN EXECUTOR
- * ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ */
+/* ── Main executor ──────────────────────────────────────────────────────── */
 int executor_execute(DatabaseManager *mgr, Database **current_db,
                      const QueryNode *query, int client_fd, char **errmsg) {
     char buf[512];
@@ -272,19 +257,17 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
 
     switch(query->type){
 
-    /* ── CREATE DATABASE ─────────────────────────────────────────────────── */
     case QUERY_CREATE_DB: {
         char *err=nullptr;
         if(dbmgr_create(mgr,query->params.db.db_name,&err)!=0){
             if(errmsg)*errmsg=err; else free(err);
             send_err(client_fd,err?err:"CREATE DATABASE failed"); return -1;
         }
-        /* LESSON 8: Persist named databases to registry */
         wal_register_db(query->params.db.db_name);
         snprintf(buf,sizeof(buf),"Database '%s' created successfully.",query->params.db.db_name);
         send_ok(client_fd,buf); return 0;
     }
-    /* ── USE ─────────────────────────────────────────────────────────────── */
+
     case QUERY_USE_DB: {
         Database *db=dbmgr_find(mgr,query->params.db.db_name);
         if(!db){
@@ -295,19 +278,18 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         snprintf(buf,sizeof(buf),"Database changed to '%s'.",db->name);
         send_ok(client_fd,buf); return 0;
     }
-    /* ── SHOW DATABASES ───────────────────────────────────────────────────── */
+
     case QUERY_SHOW_DBS: {
         char names[FLEXQL_MAX_DATABASES][FLEXQL_MAX_NAME_LEN];
         int n=dbmgr_list(mgr,names);
         if(n==0){send_ok(client_fd,"(no databases)"); return 0;}
         send_single_col_rows(client_fd,"DATABASE",names,n); return 0;
     }
-    /* ── DROP DATABASE ────────────────────────────────────────────────────── */
+
     case QUERY_DROP_DB: {
         if(*current_db&&strcasecmp((*current_db)->name,query->params.db.db_name)==0)
             *current_db=nullptr;
         if(cache) cache_invalidate_db(cache, query->params.db.db_name);
-        /* LESSON 8: Remove from registry before dropping from memory */
         wal_unregister_db(query->params.db.db_name);
         char *err=nullptr;
         if(dbmgr_drop(mgr,query->params.db.db_name,&err)!=0){
@@ -317,7 +299,7 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         snprintf(buf,sizeof(buf),"Database '%s' dropped.",query->params.db.db_name);
         send_ok(client_fd,buf); return 0;
     }
-    /* ── SHOW TABLES ──────────────────────────────────────────────────────── */
+
     case QUERY_SHOW_TABLES: {
         if(!*current_db){send_err(client_fd,"No database selected"); return -1;}
         Database *db=*current_db;
@@ -330,7 +312,6 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         send_single_col_rows(client_fd,"TABLE",tnames,cnt); return 0;
     }
 
-    /* ── CREATE TABLE ─────────────────────────────────────────────────────── */
     case QUERY_CREATE_TABLE: {
         if(!*current_db){send_err(client_fd,"No database selected"); return -1;}
         const CreateTableParams *p=&query->params.create;
@@ -341,13 +322,11 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
             if(errmsg)*errmsg=err; else free(err);
             send_err(client_fd,err?err:"CREATE TABLE failed"); return -1;
         }
-        /* LESSON 8: Persist table schema to WAL (group commit: schema is small) */
         wal_write_create_table(db_name, t);
         snprintf(buf,sizeof(buf),"Table '%s' created.",t->name);
         send_ok(client_fd,buf); return 0;
     }
 
-    /* ── INSERT ───────────────────────────────────────────────────────────── */
     case QUERY_INSERT: {
         if(!*current_db){send_err(client_fd,"No database selected"); return -1;}
         const InsertParams *p=&query->params.insert;
@@ -355,71 +334,50 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         if(!t){
             snprintf(buf,sizeof(buf),"Table '%s' does not exist",p->table_name);
             if(errmsg)*errmsg=strdup(buf); send_err(client_fd,buf);
-            /* Free batch memory before returning */
             free(p->extra_rows);
             return -1;
         }
 
-        /* ── LESSON 7: Batch INSERT loop ────────────────────────────────────
+        /* ── PERF FIX: Stack-allocate flat pointer array for WAL batch ─────
          *
-         * BEFORE (single-row only):
-         *   row_insert(t, p->values, p->value_count, p->expiry, &err)
-         *   → 1 TCP message = 1 row inserted = 1 MSG_OK reply
+         * Original code:
+         *   const char **flat = malloc(batch_row_count * value_count * sizeof(char*));
+         *   ...
+         *   free(flat);
          *
-         * AFTER (batch):
-         *   for i in 0..batch_row_count-1:
-         *     row_insert(t, row_i_values, p->value_count, p->expiry, &err)
-         *   → 1 TCP message = N rows inserted = 1 MSG_OK reply
+         * For the benchmark with INSERT_BATCH_SIZE=1:
+         *   - batch_row_count = 1, value_count = 5 (BIG_USERS columns)
+         *   - That's 5 pointers = 40 bytes — trivially stack-allocated
+         *   - Eliminates 10M heap allocations for a 10M-row benchmark
          *
-         * PERFORMANCE:
-         *   Benchmark sends INSERT INTO BIG_USERS VALUES (r1),(r2),...,(rN);
-         *   With N=1000: 1M rows = 1000 TCP roundtrips instead of 1,000,000.
-         *   Each roundtrip is eliminated entirely — not just made faster.
+         * For genuine batch inserts (batch_row_count > 1):
+         *   - total_vals = batch_row_count * value_count
+         *   - If fits in FLEXQL_MAX_COLUMNS (64 pointers, 512 bytes): use stack
+         *   - Otherwise: heap-allocate as before
          *
-         * ERROR SEMANTICS:
-         *   If any row fails (e.g. PK dupe), we stop and return error.
-         *   Rows inserted before the failure remain committed (no rollback).
-         *   This matches SQLite behaviour for multi-row INSERT.
-         *   Full rollback requires transactions (future work).
-         *
-         * MEMORY:
-         *   Row 0 is in p->values[] (inline, no allocation).
-         *   Rows 1..N-1 are in p->extra_rows (heap, freed after all inserts).
-         *   extra_rows is NULL when batch_row_count == 1 (single-row path).   */
-
-        /* ── LESSON 8: Write ALL rows to WAL BEFORE in-memory insert ────────
-         *
-         * WHY BEFORE?
-         *   The WAL is our crash-recovery guarantee.  The sequence must be:
-         *     1. Write rows to WAL + fdatasync()  ← DURABLE on disk
-         *     2. Insert rows into RAM linked list + indexes
-         *     3. Send MSG_OK to client
-         *
-         *   If we crash between step 1 and 2: on restart, WAL replay re-inserts
-         *   the rows.  Client gets MSG_OK → data is durable. ✓
-         *
-         *   If we crash between step 2 and 3: rows are in RAM and WAL.
-         *   Client never got MSG_OK so it will retry.  WAL replay may insert
-         *   duplicate rows — for tables WITH a PK this is caught by the dupe
-         *   check.  For tables WITHOUT a PK, duplicates appear.  Production
-         *   databases solve this with transaction IDs (future work).
-         *
-         * GROUP COMMIT: all N batch rows are written in ONE write() + ONE
-         * fdatasync().  Cost: O(1) disk syncs per batch INSERT statement,
-         * regardless of batch size.  This is the key to high write throughput.
-         *
-         * Build a flat string pointer array for wal_write_insert_batch.
-         * Row 0 is in p->values, rows 1..N-1 are in p->extra_rows.       */
+         * The stack path covers 100% of single-row inserts and all batches
+         * up to 64/value_count rows (e.g. batches of 12 for a 5-col table).
+         */
         if (wal_is_persistent(db_name)) {
-            /* Build flat array: row_count * value_count string pointers  */
             int total_vals = p->batch_row_count * p->value_count;
-            const char **flat = (const char**)malloc(
-                (size_t)total_vals * sizeof(const char*));
+
+            /* Stack buffer covers single-row inserts (the benchmark's pattern)
+               and small batches without any heap allocation at all. */
+            const char *flat_stack[FLEXQL_MAX_COLUMNS];
+            const char **flat = nullptr;
+            bool heap_alloc = false;
+
+            if (total_vals <= FLEXQL_MAX_COLUMNS) {
+                flat = flat_stack;
+            } else {
+                flat = (const char**)malloc((size_t)total_vals * sizeof(const char*));
+                heap_alloc = (flat != nullptr);
+            }
+
             if (flat) {
                 for (int r = 0; r < p->batch_row_count; r++) {
                     const char (*rv)[FLEXQL_MAX_VARCHAR] =
-                        (r == 0) ? p->values
-                                 : p->extra_rows[r-1];
+                        (r == 0) ? p->values : p->extra_rows[r-1];
                     for (int c = 0; c < p->value_count; c++)
                         flat[r * p->value_count + c] = rv[c];
                 }
@@ -427,7 +385,7 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
                                        flat,
                                        p->batch_row_count, p->value_count,
                                        p->expiry);
-                free(flat);
+                if (heap_alloc) free((void*)flat);
             }
         }
 
@@ -435,7 +393,6 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         int   rows_inserted = 0;
 
         for (int r = 0; r < p->batch_row_count; r++) {
-            /* Get the pointer to this row's values array */
             const char (*row_vals)[FLEXQL_MAX_VARCHAR];
             if (r == 0) {
                 row_vals = p->values;
@@ -448,7 +405,6 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
                            p->value_count,
                            p->expiry,
                            &ins_err) != 0) {
-                /* Insert failed — stop, report, clean up heap, return error */
                 if (errmsg) *errmsg = ins_err; else free(ins_err);
                 send_err(client_fd, ins_err ? ins_err : "INSERT failed");
                 free(p->extra_rows);
@@ -457,13 +413,10 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
             rows_inserted++;
         }
 
-        /* Free the heap-allocated extra rows (NULL-safe) */
         free(p->extra_rows);
 
-        /* Invalidate cache once for all inserted rows */
         if(cache) cache_invalidate_table(cache, db_name, p->table_name);
 
-        /* Report total rows inserted */
         if (p->batch_row_count == 1) {
             send_ok(client_fd, "1 row inserted.");
         } else {
@@ -473,29 +426,16 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         return 0;
     }
 
-    /* ── SELECT ───────────────────────────────────────────────────────────── */
     case QUERY_SELECT: {
         if(!*current_db){send_err(client_fd,"No database selected"); return -1;}
         const SelectParams *p=&query->params.select;
 
-        /* CACHE MISS — find table first (needed for both validation and scan) */
         Table *t=table_find(*current_db,p->table_name);
         if(!t){
             snprintf(buf,sizeof(buf),"Table '%s' does not exist",p->table_name);
             if(errmsg)*errmsg=strdup(buf); send_err(client_fd,buf); return -1;
         }
 
-        /* ── FIX: Validate columns BEFORE cache lookup ───────────────────────
-         * IMPORTANT: This check must happen before the cache lookup.
-         *
-         * Why? The cache key does not include the column list:
-         *   "SELECT * FROM T"       → key "SELECT:T:WHERE:::"
-         *   "SELECT BADCOL FROM T"  → key "SELECT:T:WHERE:::"  (SAME!)
-         * If we checked after the cache, a cached result for "SELECT *"
-         * would be returned for "SELECT BADCOL" — hiding the error.
-         *
-         * By validating first, we return an error before touching the cache
-         * for any query referencing an unknown column.                       */
         if (!p->select.select_all) {
             for (int s = 0; s < p->select.col_count; s++) {
                 const char *cname = p->select.col_names[s];
@@ -518,7 +458,6 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
             }
         }
 
-        /* Build cache key and check cache */
         char sql_key[CACHE_KEY_MAX];
         snprintf(sql_key, CACHE_KEY_MAX, "SELECT:%s:WHERE:%s:%s:%s",
                  p->table_name,
@@ -549,7 +488,6 @@ int executor_execute(DatabaseManager *mgr, Database **current_db,
         return 0;
     }
 
-    /* ── INNER JOIN ───────────────────────────────────────────────────────── */
     case QUERY_INNER_JOIN: {
         if(!*current_db){send_err(client_fd,"No database selected"); return -1;}
         const SelectParams *p=&query->params.select;

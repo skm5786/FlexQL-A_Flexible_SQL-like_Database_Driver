@@ -1,28 +1,67 @@
 /**
- * server.cpp  —  FlexQL Multithreaded Server  (Lesson 6 — Default DB fix)
+ * server.cpp  —  FlexQL Multithreaded Server
  *
- * CHANGE FROM LESSON 5:
+ * ═══════════════════════════════════════════════════════════════════════
+ * ROOT CAUSE FIX — "Nothing stored in data/ folder"
+ * ═══════════════════════════════════════════════════════════════════════
  *
- *   FIX — Default database per client connection:
+ * PROBLEM:
+ *   The benchmark (benchmark_flexql.cpp) never sends CREATE DATABASE or
+ *   USE before issuing CREATE TABLE / INSERT.  The server previously
+ *   handled this by auto-creating a _SESSION_<fd> database per connection
+ *   and setting that as current_db.
  *
- *   The benchmark never sends CREATE DATABASE or USE.  It connects and
- *   immediately fires CREATE TABLE, INSERT, SELECT.  Our server previously
- *   blocked all table commands when current_db == nullptr, causing every
- *   benchmark command to fail with "No database selected".
+ *   The WAL layer has this check in wal.cpp:
  *
- *   Solution: when a client connects, automatically create and select a
- *   session-private database named "_SESSION_<fd>" (e.g. "_SESSION_4").
- *   When the client disconnects, drop it.  This makes each client get its
- *   own isolated namespace with zero client-side setup required.
+ *     int wal_is_persistent(const char *db_name) {
+ *         return (strncmp(db_name, "_SESSION_", 9) != 0);
+ *     }
  *
- *   Why session-private?  If two clients connect simultaneously, they must
- *   not share tables.  Naming the DB after the file descriptor guarantees
- *   uniqueness (the OS never reuses an fd while it is open).
+ *   Because _SESSION_<fd> starts with "_SESSION_", wal_is_persistent()
+ *   returns 0.  Every wal_write_create_table() and wal_write_insert_batch()
+ *   call begins with:
  *
- *   The explicit CREATE DATABASE / USE commands still work — a client that
- *   sends USE university; will switch away from the auto-created session DB
- *   and work in the named database for the rest of its session.
+ *     if (!wal_is_persistent(db_name)) return 0;   ← skips all disk writes
+ *
+ *   Result: data/ stays completely empty.  Server restart = blank state.
+ *
+ * FIX — Two-part server-side change, benchmark untouched:
+ *
+ *   1. On connection: auto-create a PERSISTENT database named "DEFAULT"
+ *      (no underscore prefix, passes wal_is_persistent()) and set it as
+ *      current_db.  The benchmark immediately gets a WAL-backed database
+ *      without sending any setup SQL.
+ *
+ *   2. On disconnect: do NOT drop "DEFAULT".  It is a shared persistent
+ *      database that survives connections.  Only the in-memory state for
+ *      that connection's context pointer is released (the Database* itself
+ *      stays alive in DatabaseManager).
+ *
+ * DESIGN NOTES:
+ *
+ *   - "DEFAULT" is created once.  dbmgr_create() returns an error if it
+ *     already exists; we silently ignore that error — it just means the
+ *     database was already there from a previous connection or WAL recovery.
+ *
+ *   - WAL recovery on startup replays data/DEFAULT/*.wal and rebuilds all
+ *     tables that were ever created via the benchmark.
+ *
+ *   - Clients that explicitly send CREATE DATABASE mydb; USE mydb; still
+ *     work correctly — USE switches current_db away from DEFAULT and all
+ *     subsequent operations go into their chosen database.
+ *
+ *   - The REPL client (flexql-client) is unaffected — it also starts in
+ *     DEFAULT but can USE any database it creates.
+ *
+ *   - Multiple simultaneous benchmark connections all share DEFAULT.  This
+ *     is correct: they create tables with unique names (BIG_USERS,
+ *     TEST_USERS, TEST_ORDERS) and there is no cross-client naming conflict
+ *     in the TA benchmark.  The table-level rwlock handles concurrency.
+ *
+ *   - "DEFAULT" is registered in data/_registry on first creation, so
+ *     wal_recover() finds it on the next startup.
  */
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -49,19 +88,25 @@
 int executor_execute(DatabaseManager *mgr, Database **current_db,
                      const QueryNode *query, int client_fd, char **errmsg);
 
-/* ── Global database manager ──────────────────────────────────────────────── */
+/* ── The name of the auto-created persistent database ───────────────────
+ * Must NOT start with "_SESSION_" — that prefix is what wal_is_persistent()
+ * uses to decide whether to skip WAL writes.
+ * "DEFAULT" is short, obvious, and passes the persistence check.
+ */
+#define DEFAULT_DB_NAME  "DEFAULT"
+
+/* ── Global database manager ────────────────────────────────────────────── */
 static DatabaseManager g_manager;
 
-/* ── Client context ───────────────────────────────────────────────────────── */
+/* ── Client context ─────────────────────────────────────────────────────── */
 typedef struct {
     int              client_fd;
     char             client_ip[64];
     DatabaseManager *mgr;
-    Database        *current_db;
-    char             session_db_name[64]; /* auto-created DB name for this fd */
+    Database        *current_db;   /* starts pointing at DEFAULT */
 } ClientContext;
 
-/* ── Wire protocol helpers ────────────────────────────────────────────────── */
+/* ── Wire protocol helpers ──────────────────────────────────────────────── */
 static int send_all(int fd, const void *buf, size_t len) {
     const char *p = static_cast<const char *>(buf);
     size_t rem = len;
@@ -107,39 +152,58 @@ static int recv_message(int fd, MessageType *type,
     return 0;
 }
 
-/* ── Worker thread ────────────────────────────────────────────────────────── */
+/* ── Ensure the DEFAULT database exists (idempotent) ────────────────────
+ *
+ * Called once at server startup (after WAL recovery) AND at the start of
+ * every client_worker thread.  If DEFAULT was already recovered from WAL
+ * or created by a previous call, dbmgr_create() returns an error which we
+ * silently discard — the database is already there.
+ *
+ * Returns a pointer to the DEFAULT Database, or NULL on unexpected failure.
+ */
+static Database *ensure_default_db(DatabaseManager *mgr) {
+    /* Try to create — silently ignore "already exists" */
+    char *err = nullptr;
+    dbmgr_create(mgr, DEFAULT_DB_NAME, &err);
+    if (err) free(err);   /* "already exists" is not an error for us */
+
+    Database *db = dbmgr_find(mgr, DEFAULT_DB_NAME);
+    if (!db) {
+        fprintf(stderr, "[server] ERROR: cannot find/create DEFAULT database\n");
+    }
+    return db;
+}
+
+/* ── Worker thread ──────────────────────────────────────────────────────── */
 static void *client_worker(void *arg) {
     ClientContext *ctx = static_cast<ClientContext *>(arg);
     int              fd  = ctx->client_fd;
     DatabaseManager *mgr = ctx->mgr;
-    char             session_db[64];
-    strncpy(session_db, ctx->session_db_name, sizeof(session_db));
     char             ip[64];
     strncpy(ip, ctx->client_ip, sizeof(ip));
+    free(ctx);
 
-    /* ── FIX: Auto-create and select a session database ────────────────────
-     * The benchmark connects and immediately runs CREATE TABLE without any
-     * CREATE DATABASE or USE command.  We create a private database for
-     * this connection so table commands work from the very first query.
+    /* ── FIX: Set current_db to DEFAULT (a persistent, WAL-backed DB) ───
      *
-     * Name format: "_SESSION_<fd>"  (underscore prefix avoids collisions
-     * with user-created databases; fd is unique while the socket is open).  */
-    char *setup_err = nullptr;
-    dbmgr_create(mgr, session_db, &setup_err);
-    free(setup_err); setup_err = nullptr;
-
-    Database *cur = dbmgr_find(mgr, session_db);
+     * Previously: current_db = _SESSION_<fd>  → wal_is_persistent() = 0
+     *                                          → NO disk writes ever
+     *
+     * Now:        current_db = DEFAULT         → wal_is_persistent() = 1
+     *                                          → all CREATE TABLE + INSERT
+     *                                             written to data/DEFAULT/
+     *
+     * ensure_default_db() is idempotent — if DEFAULT already exists (from
+     * a previous connection or from WAL recovery) it just returns it.
+     */
+    Database *cur = ensure_default_db(mgr);
     if (!cur) {
-        /* This should never happen, but fail safely */
-        printf("[server] ERROR: cannot create session DB for fd=%d\n", fd);
+        printf("[server] ERROR: no DEFAULT db, closing connection fd=%d\n", fd);
         close(fd);
-        free(ctx);
         return nullptr;
     }
 
-    free(ctx);   /* ctx was heap-allocated; unpack everything before freeing */
-    printf("[server] Client connected: %s (fd=%d, session=%s)\n",
-           ip, fd, session_db);
+    printf("[server] Client connected: %s (fd=%d, db=%s)\n",
+           ip, fd, DEFAULT_DB_NAME);
 
     while (true) {
         MessageType type;
@@ -157,34 +221,31 @@ static void *client_worker(void *arg) {
         free(payload);
 
         if (rc != 0) {
-            send_message(fd, MSG_ERROR,
-                         errmsg ? errmsg : "Parse error",
-                         (uint32_t)(errmsg ? strlen(errmsg) : 11));
+            const char *msg = errmsg ? errmsg : "Parse error";
+            send_message(fd, MSG_ERROR, msg, (uint32_t)strlen(msg));
             free(errmsg);
             continue;
         }
 
-        /* DB-level commands (CREATE DB, USE, SHOW, DROP) need no current_db.
-           All other commands use cur (which is always set now).            */
         rc = executor_execute(mgr, &cur, &qnode, fd, &errmsg);
-        if (rc != 0) {
-            /* Error was already sent to client by executor; log it here    */
-        }
+        (void)rc;
         free(errmsg);
     }
 
-    /* ── FIX: Clean up the session database on disconnect ─────────────────
-     * Drop the auto-created session database so it doesn't accumulate.
-     * If the client ran "USE university;" and created data there, that data
-     * stays — we only drop the session-private DB.                         */
-    dbmgr_drop(mgr, session_db, nullptr);
-
+    /* ── Do NOT drop DEFAULT on disconnect ───────────────────────────────
+     *
+     * Previously we called dbmgr_drop(_SESSION_<fd>) here.
+     * DEFAULT is shared and persistent — dropping it would delete all
+     * tables and data for every other connected client.
+     *
+     * Nothing to clean up: DEFAULT persists in DatabaseManager and on disk.
+     */
     close(fd);
     printf("[server] Client disconnected: %s\n", ip);
     return nullptr;
 }
 
-/* ── Signal handler ───────────────────────────────────────────────────────── */
+/* ── Signal handler ─────────────────────────────────────────────────────── */
 static volatile int g_running = 1;
 static void sigint_handler(int sig) {
     (void)sig;
@@ -193,27 +254,40 @@ static void sigint_handler(int sig) {
     write(STDERR_FILENO, msg, strlen(msg));
 }
 
-/* ── main ─────────────────────────────────────────────────────────────────── */
+/* ── main ───────────────────────────────────────────────────────────────── */
 int main(int argc, char *argv[]) {
     int port = 9000;
     if (argc >= 2) port = atoi(argv[1]);
 
     dbmgr_init(&g_manager);
 
-    /* ── LESSON 8: Recover persistent data from WAL on startup ────────────
-     *
-     * This replays every WAL file to rebuild the in-memory state.
-     * After this call, all named databases and their tables/rows are
-     * available in RAM exactly as they were before the last shutdown.
-     *
-     * Session databases (_SESSION_*) are never written to WAL so they
-     * are not recovered — they are per-connection ephemeral namespaces.
-     *
-     * Recovery happens BEFORE we accept any client connections, so there
-     * is no race between recovery and incoming queries.                   */
-    wal_recover(&g_manager);
+    /* Recover persistent data from WAL (replays data/DEFAULT/*.wal etc.) */
+    int recovered = wal_recover(&g_manager);
+    printf("[server] WAL recovery complete: %d database(s) restored\n",
+           recovered);
 
-    /* LESSON 9: Start background expiry thread */
+    /* ── Ensure DEFAULT database exists after recovery ─────────────────
+     * If DEFAULT was in data/_registry, wal_recover() already created it.
+     * If this is a fresh install (no data/ yet), create it now and register
+     * it in the registry so future restarts recover it.
+     */
+    {
+        char *err = nullptr;
+        int rc = dbmgr_create(&g_manager, DEFAULT_DB_NAME, &err);
+        if (rc == 0) {
+            /* Freshly created — register in WAL registry */
+            wal_register_db(DEFAULT_DB_NAME);
+            printf("[server] Created persistent DEFAULT database "
+                   "(data/%s/)\n", DEFAULT_DB_NAME);
+        } else {
+            /* Already existed from recovery — that's fine */
+            printf("[server] DEFAULT database recovered from WAL "
+                   "(data/%s/)\n", DEFAULT_DB_NAME);
+        }
+        if (err) free(err);
+    }
+
+    /* Start background expiry thread */
     expiry_start(&g_manager);
 
     signal(SIGINT,  sigint_handler);
@@ -236,58 +310,31 @@ int main(int argc, char *argv[]) {
     if (listen(listen_fd, 128) < 0) { perror("listen"); return 1; }
 
     printf("[server] FlexQL server listening on port %d\n", port);
+    printf("[server] All tables created via benchmark stored in "
+           "data/%s/\n", DEFAULT_DB_NAME);
 
     while (g_running) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(listen_fd, &readfds);
 
-        struct timeval tv; tv.tv_sec=1; tv.tv_usec=0;
-        int ready = select(listen_fd+1, &readfds, nullptr, nullptr, &tv);
-        if (ready < 0) { if (errno==EINTR) continue; perror("select"); break; }
+        struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
+        int ready = select(listen_fd + 1, &readfds,
+                           nullptr, nullptr, &tv);
+        if (ready < 0) { if (errno == EINTR) continue; perror("select"); break; }
         if (ready == 0) continue;
 
         struct sockaddr_in client_addr{};
         socklen_t          client_len = sizeof(client_addr);
-        int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &client_len);
+        int client_fd = accept(listen_fd,
+                               (sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) { if (g_running) perror("accept"); continue; }
 
-        /* ── LESSON 7: TCP socket tuning ────────────────────────────────────
-         *
-         * TCP_NODELAY — disables Nagle's algorithm.
-         *
-         * Nagle's algorithm (RFC 896) was designed to reduce small-packet
-         * overhead on slow WAN links by buffering data until either:
-         *   a) The buffer fills to MSS (≈1460 bytes), OR
-         *   b) An ACK is received for previously sent data
-         *
-         * For our workload this is harmful:
-         *   - Each MSG_OK response is ~9 bytes (header + "1 row inserted.")
-         *   - Nagle holds the response waiting for more data to batch with
-         *   - The client's OS holds its next INSERT waiting for an ACK
-         *   - Result: 40–200ms "delayed ACK" stall per INSERT on macOS
-         *
-         * TCP_NODELAY = 1 forces every send() to go out immediately.
-         * Combined with TCP_NODELAY on the client socket, this eliminates
-         * the Nagle + delayed-ACK deadlock entirely.
-         *
-         * Expected gain on localhost:
-         *   macOS: 2–10× throughput improvement (delayed ACK = 200ms default)
-         *   Linux: 1.2–2× (delayed ACK = 40ms default)
-         *
-         * SO_RCVBUF / SO_SNDBUF — socket kernel buffer sizes.
-         *   Default is 87KB on Linux, 128KB on macOS.
-         *   256KB buffers help when the client sends large batch INSERT
-         *   SQL strings (1000-row batch ≈ 50KB of SQL text) — the kernel
-         *   can buffer the full string in one recv() call rather than
-         *   fragmenting it across multiple smaller reads.
-         *   The server also sends MSG_DONE/MSG_OK replies faster because
-         *   the send buffer can absorb them without blocking.              */
+        /* TCP performance settings */
         int tcp_flag = 1;
         setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY,
                    &tcp_flag, sizeof(tcp_flag));
-
-        int buf_size = 256 * 1024;  /* 256 KB */
+        int buf_size = 256 * 1024;
         setsockopt(client_fd, SOL_SOCKET, SO_RCVBUF,
                    &buf_size, sizeof(buf_size));
         setsockopt(client_fd, SOL_SOCKET, SO_SNDBUF,
@@ -297,12 +344,9 @@ int main(int argc, char *argv[]) {
                                  calloc(1, sizeof(ClientContext)));
         ctx->client_fd  = client_fd;
         ctx->mgr        = &g_manager;
-        ctx->current_db = nullptr;
+        ctx->current_db = nullptr;   /* set inside client_worker */
         inet_ntop(AF_INET, &client_addr.sin_addr,
                   ctx->client_ip, sizeof(ctx->client_ip));
-        /* Build the session database name using the file descriptor          */
-        snprintf(ctx->session_db_name, sizeof(ctx->session_db_name),
-                 "_SESSION_%d", client_fd);
 
         pthread_t tid;
         pthread_attr_t attr;
@@ -313,7 +357,7 @@ int main(int argc, char *argv[]) {
     }
 
     close(listen_fd);
-    expiry_stop();              /* LESSON 9: stop background thread first */
+    expiry_stop();
     dbmgr_destroy(&g_manager);
     printf("[server] Shutdown complete.\n");
     return 0;

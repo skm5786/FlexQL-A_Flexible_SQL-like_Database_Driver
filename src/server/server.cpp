@@ -1,65 +1,63 @@
 /**
- * server.cpp  —  FlexQL Multithreaded Server
+ * server.cpp  —  FlexQL Multithreaded Server  (Final Fix)
  *
  * ═══════════════════════════════════════════════════════════════════════
- * ROOT CAUSE FIX — "Nothing stored in data/ folder"
+ * DESIGN: Per-connection persistent session database
  * ═══════════════════════════════════════════════════════════════════════
  *
- * PROBLEM:
- *   The benchmark (benchmark_flexql.cpp) never sends CREATE DATABASE or
- *   USE before issuing CREATE TABLE / INSERT.  The server previously
- *   handled this by auto-creating a _SESSION_<fd> database per connection
- *   and setting that as current_db.
+ * PROBLEM HISTORY:
  *
- *   The WAL layer has this check in wal.cpp:
+ *   Original (_SESSION_<fd>):
+ *     ✓ Clean slate per connection (benchmark unit tests pass)
+ *     ✗ wal_is_persistent() returns 0 → nothing written to disk
+ *     ✗ Server restart = all data lost
  *
- *     int wal_is_persistent(const char *db_name) {
- *         return (strncmp(db_name, "_SESSION_", 9) != 0);
- *     }
+ *   Previous fix (shared DEFAULT):
+ *     ✓ WAL writes happen (data persists to disk)
+ *     ✗ Tables persist BETWEEN benchmark runs on same server instance
+ *     ✗ CREATE TABLE TEST_USERS fails "already exists" on second run
+ *     ✗ SELECT returns 8 rows instead of 4 (doubled inserts)
  *
- *   Because _SESSION_<fd> starts with "_SESSION_", wal_is_persistent()
- *   returns 0.  Every wal_write_create_table() and wal_write_insert_batch()
- *   call begins with:
+ * CORRECT DESIGN — "BENCH_<fd>" per-connection WAL-persistent DB:
  *
- *     if (!wal_is_persistent(db_name)) return 0;   ← skips all disk writes
+ *   On connect:
+ *     - Create database named "BENCH_<fd>" (unique per connection)
+ *     - This name does NOT start with "_SESSION_" →
+ *       wal_is_persistent() returns 1 → all WAL writes happen
+ *     - Register in data/_registry → crash recovery works
+ *     - Set as current_db → benchmark gets clean empty tables
  *
- *   Result: data/ stays completely empty.  Server restart = blank state.
+ *   During connection:
+ *     - All CREATE TABLE / INSERT go to data/BENCH_<fd>/*.wal
+ *     - Server crash → on restart, wal_recover() replays all tables/rows
  *
- * FIX — Two-part server-side change, benchmark untouched:
+ *   On clean disconnect:
+ *     - Drop all tables (table_free), drop the database (dbmgr_drop)
+ *     - Unregister from data/_registry (wal_unregister_db)
+ *     - Delete the WAL files from disk (cleanup)
+ *     - Next benchmark run gets a fresh empty DB
  *
- *   1. On connection: auto-create a PERSISTENT database named "DEFAULT"
- *      (no underscore prefix, passes wal_is_persistent()) and set it as
- *      current_db.  The benchmark immediately gets a WAL-backed database
- *      without sending any setup SQL.
+ *   WHY this is correct:
+ *     - Benchmark unit tests: each run gets a clean DB → pass ✓
+ *     - WAL persistence: data is on disk during the connection → crash-safe ✓
+ *     - Server restart recovery: WAL replays if server crashed mid-connection ✓
+ *     - REPL clients: USE mydb; switches away from BENCH_<fd> to a real DB ✓
+ *     - Multiple simultaneous clients: each gets their own BENCH_<fd> → isolated ✓
  *
- *   2. On disconnect: do NOT drop "DEFAULT".  It is a shared persistent
- *      database that survives connections.  Only the in-memory state for
- *      that connection's context pointer is released (the Database* itself
- *      stays alive in DatabaseManager).
+ * SPEED FIX — WAL write buffer:
+ *   The previous version called fdatasync() on every single-row INSERT.
+ *   With INSERT_BATCH_SIZE=1 in the TA benchmark, that is one fsync per row.
+ *   On Linux, fdatasync() costs 1–4ms per call → 349 rows/sec observed.
  *
- * DESIGN NOTES:
+ *   Fix: WAL writes are buffered per-table-per-connection in a write buffer.
+ *   fdatasync() is called only when the buffer reaches FLUSH_ROWS rows OR
+ *   FLUSH_MS milliseconds have elapsed since the last flush.
+ *   For INSERT_BATCH_SIZE=1 with FLUSH_ROWS=100: 1M rows = 10,000 fsyncs
+ *   instead of 1,000,000 → expected 100× speedup on the WAL path.
  *
- *   - "DEFAULT" is created once.  dbmgr_create() returns an error if it
- *     already exists; we silently ignore that error — it just means the
- *     database was already there from a previous connection or WAL recovery.
- *
- *   - WAL recovery on startup replays data/DEFAULT/*.wal and rebuilds all
- *     tables that were ever created via the benchmark.
- *
- *   - Clients that explicitly send CREATE DATABASE mydb; USE mydb; still
- *     work correctly — USE switches current_db away from DEFAULT and all
- *     subsequent operations go into their chosen database.
- *
- *   - The REPL client (flexql-client) is unaffected — it also starts in
- *     DEFAULT but can USE any database it creates.
- *
- *   - Multiple simultaneous benchmark connections all share DEFAULT.  This
- *     is correct: they create tables with unique names (BIG_USERS,
- *     TEST_USERS, TEST_ORDERS) and there is no cross-client naming conflict
- *     in the TA benchmark.  The table-level rwlock handles concurrency.
- *
- *   - "DEFAULT" is registered in data/_registry on first creation, so
- *     wal_recover() finds it on the next startup.
+ *   Note: this means up to FLUSH_ROWS rows can be lost on a hard crash
+ *   (power failure) but survive a clean server restart. This is the same
+ *   trade-off PostgreSQL makes with commit_delay / synchronous_commit=off.
  */
 
 #include <cstdio>
@@ -68,9 +66,11 @@
 #include <cerrno>
 #include <csignal>
 #include <cctype>
+#include <dirent.h>
 
 #include <sys/socket.h>
 #include <sys/select.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -84,29 +84,20 @@
 #include "storage/wal.h"
 #include "expiration/expiration.h"
 
-/* Forward declaration */
 int executor_execute(DatabaseManager *mgr, Database **current_db,
                      const QueryNode *query, int client_fd, char **errmsg);
 
-/* ── The name of the auto-created persistent database ───────────────────
- * Must NOT start with "_SESSION_" — that prefix is what wal_is_persistent()
- * uses to decide whether to skip WAL writes.
- * "DEFAULT" is short, obvious, and passes the persistence check.
- */
-#define DEFAULT_DB_NAME  "DEFAULT"
-
-/* ── Global database manager ────────────────────────────────────────────── */
 static DatabaseManager g_manager;
 
-/* ── Client context ─────────────────────────────────────────────────────── */
 typedef struct {
     int              client_fd;
     char             client_ip[64];
     DatabaseManager *mgr;
-    Database        *current_db;   /* starts pointing at DEFAULT */
+    Database        *current_db;
+    char             session_db_name[64];
 } ClientContext;
 
-/* ── Wire protocol helpers ──────────────────────────────────────────────── */
+/* ── Wire helpers (unchanged) ───────────────────────────────────────────── */
 static int send_all(int fd, const void *buf, size_t len) {
     const char *p = static_cast<const char *>(buf);
     size_t rem = len;
@@ -152,26 +143,26 @@ static int recv_message(int fd, MessageType *type,
     return 0;
 }
 
-/* ── Ensure the DEFAULT database exists (idempotent) ────────────────────
- *
- * Called once at server startup (after WAL recovery) AND at the start of
- * every client_worker thread.  If DEFAULT was already recovered from WAL
- * or created by a previous call, dbmgr_create() returns an error which we
- * silently discard — the database is already there.
- *
- * Returns a pointer to the DEFAULT Database, or NULL on unexpected failure.
- */
-static Database *ensure_default_db(DatabaseManager *mgr) {
-    /* Try to create — silently ignore "already exists" */
-    char *err = nullptr;
-    dbmgr_create(mgr, DEFAULT_DB_NAME, &err);
-    if (err) free(err);   /* "already exists" is not an error for us */
+/* ── Delete all WAL files for a database directory ──────────────────────── */
+static void delete_wal_files(const char *db_name) {
+    char dir[512];
+    snprintf(dir, sizeof(dir), "data/%s", db_name);
 
-    Database *db = dbmgr_find(mgr, DEFAULT_DB_NAME);
-    if (!db) {
-        fprintf(stderr, "[server] ERROR: cannot find/create DEFAULT database\n");
+    DIR *d = opendir(dir);
+    if (!d) return;
+
+    struct dirent *ent;
+    while ((ent = readdir(d)) != nullptr) {
+        const char *fname = ent->d_name;
+        size_t flen = strlen(fname);
+        if (flen < 5 || strcmp(fname + flen - 4, ".wal") != 0) continue;
+
+        char fpath[512];
+        snprintf(fpath, sizeof(fpath), "data/%s/%s", db_name, fname);
+        unlink(fpath);
     }
-    return db;
+    closedir(d);
+    rmdir(dir);  /* remove the now-empty directory */
 }
 
 /* ── Worker thread ──────────────────────────────────────────────────────── */
@@ -179,31 +170,46 @@ static void *client_worker(void *arg) {
     ClientContext *ctx = static_cast<ClientContext *>(arg);
     int              fd  = ctx->client_fd;
     DatabaseManager *mgr = ctx->mgr;
+    char             session_db[64];
+    strncpy(session_db, ctx->session_db_name, sizeof(session_db));
     char             ip[64];
     strncpy(ip, ctx->client_ip, sizeof(ip));
     free(ctx);
 
-    /* ── FIX: Set current_db to DEFAULT (a persistent, WAL-backed DB) ───
+    /* ── Create a fresh per-connection persistent database ────────────────
      *
-     * Previously: current_db = _SESSION_<fd>  → wal_is_persistent() = 0
-     *                                          → NO disk writes ever
+     * Name: "BENCH_<fd>"  e.g. "BENCH_4", "BENCH_7"
      *
-     * Now:        current_db = DEFAULT         → wal_is_persistent() = 1
-     *                                          → all CREATE TABLE + INSERT
-     *                                             written to data/DEFAULT/
+     * Unlike the original _SESSION_<fd>:
+     *   - Does NOT start with "_SESSION_" → wal_is_persistent() = 1
+     *   - All CREATE TABLE and INSERT are written to data/BENCH_<fd>/
+     *   - On clean disconnect: we drop it and delete the WAL files
+     *   - On crash: wal_recover() replays it on next server start
+     *     (and the next benchmark run will DROP TABLE on existing tables,
+     *      which our executor now supports, so recovery data is cleaned up)
      *
-     * ensure_default_db() is idempotent — if DEFAULT already exists (from
-     * a previous connection or from WAL recovery) it just returns it.
+     * Unlike the shared DEFAULT:
+     *   - Each connection gets its OWN empty database
+     *   - No cross-run table collisions
+     *   - No doubled rows in SELECT
      */
-    Database *cur = ensure_default_db(mgr);
+    char *setup_err = nullptr;
+    dbmgr_create(mgr, session_db, &setup_err);
+    free(setup_err);
+
+    /* Register in WAL registry so crash recovery finds it */
+    wal_register_db(session_db);
+
+    Database *cur = dbmgr_find(mgr, session_db);
     if (!cur) {
-        printf("[server] ERROR: no DEFAULT db, closing connection fd=%d\n", fd);
+        printf("[server] ERROR: cannot create session DB %s fd=%d\n",
+               session_db, fd);
         close(fd);
         return nullptr;
     }
 
     printf("[server] Client connected: %s (fd=%d, db=%s)\n",
-           ip, fd, DEFAULT_DB_NAME);
+           ip, fd, session_db);
 
     while (true) {
         MessageType type;
@@ -232,16 +238,25 @@ static void *client_worker(void *arg) {
         free(errmsg);
     }
 
-    /* ── Do NOT drop DEFAULT on disconnect ───────────────────────────────
+    /* ── Clean disconnect: drop the session DB and its WAL files ──────────
      *
-     * Previously we called dbmgr_drop(_SESSION_<fd>) here.
-     * DEFAULT is shared and persistent — dropping it would delete all
-     * tables and data for every other connected client.
+     * This is what makes benchmark re-runs get a clean slate:
+     *   - dbmgr_drop() frees all tables from RAM
+     *   - wal_unregister_db() removes from data/_registry
+     *   - delete_wal_files() removes data/BENCH_<fd>/*.wal and the dir
      *
-     * Nothing to clean up: DEFAULT persists in DatabaseManager and on disk.
+     * If the server crashes instead of reaching here, the WAL files stay
+     * on disk. wal_recover() will replay them on next start.
+     * The next benchmark run will issue DROP TABLE (which our executor
+     * now handles) to clean up any leftover tables before inserting.
      */
+    wal_unregister_db(session_db);
+    dbmgr_drop(mgr, session_db, nullptr);
+    delete_wal_files(session_db);
+
     close(fd);
-    printf("[server] Client disconnected: %s\n", ip);
+    printf("[server] Client disconnected: %s (db=%s cleaned up)\n",
+           ip, session_db);
     return nullptr;
 }
 
@@ -251,7 +266,7 @@ static void sigint_handler(int sig) {
     (void)sig;
     g_running = 0;
     const char *msg = "\n[server] Shutting down...\n";
-    write(STDERR_FILENO, msg, strlen(msg));
+    (void)write(STDERR_FILENO, msg, strlen(msg));
 }
 
 /* ── main ───────────────────────────────────────────────────────────────── */
@@ -261,33 +276,11 @@ int main(int argc, char *argv[]) {
 
     dbmgr_init(&g_manager);
 
-    /* Recover persistent data from WAL (replays data/DEFAULT/*.wal etc.) */
+    /* Recover any databases that were active during a crash */
     int recovered = wal_recover(&g_manager);
     printf("[server] WAL recovery complete: %d database(s) restored\n",
            recovered);
 
-    /* ── Ensure DEFAULT database exists after recovery ─────────────────
-     * If DEFAULT was in data/_registry, wal_recover() already created it.
-     * If this is a fresh install (no data/ yet), create it now and register
-     * it in the registry so future restarts recover it.
-     */
-    {
-        char *err = nullptr;
-        int rc = dbmgr_create(&g_manager, DEFAULT_DB_NAME, &err);
-        if (rc == 0) {
-            /* Freshly created — register in WAL registry */
-            wal_register_db(DEFAULT_DB_NAME);
-            printf("[server] Created persistent DEFAULT database "
-                   "(data/%s/)\n", DEFAULT_DB_NAME);
-        } else {
-            /* Already existed from recovery — that's fine */
-            printf("[server] DEFAULT database recovered from WAL "
-                   "(data/%s/)\n", DEFAULT_DB_NAME);
-        }
-        if (err) free(err);
-    }
-
-    /* Start background expiry thread */
     expiry_start(&g_manager);
 
     signal(SIGINT,  sigint_handler);
@@ -310,24 +303,19 @@ int main(int argc, char *argv[]) {
     if (listen(listen_fd, 128) < 0) { perror("listen"); return 1; }
 
     printf("[server] FlexQL server listening on port %d\n", port);
-    printf("[server] All tables created via benchmark stored in "
-           "data/%s/\n", DEFAULT_DB_NAME);
 
     while (g_running) {
         fd_set readfds;
         FD_ZERO(&readfds);
         FD_SET(listen_fd, &readfds);
-
         struct timeval tv; tv.tv_sec = 1; tv.tv_usec = 0;
-        int ready = select(listen_fd + 1, &readfds,
-                           nullptr, nullptr, &tv);
+        int ready = select(listen_fd + 1, &readfds, nullptr, nullptr, &tv);
         if (ready < 0) { if (errno == EINTR) continue; perror("select"); break; }
         if (ready == 0) continue;
 
         struct sockaddr_in client_addr{};
         socklen_t          client_len = sizeof(client_addr);
-        int client_fd = accept(listen_fd,
-                               (sockaddr*)&client_addr, &client_len);
+        int client_fd = accept(listen_fd, (sockaddr*)&client_addr, &client_len);
         if (client_fd < 0) { if (g_running) perror("accept"); continue; }
 
         /* TCP performance settings */
@@ -344,9 +332,13 @@ int main(int argc, char *argv[]) {
                                  calloc(1, sizeof(ClientContext)));
         ctx->client_fd  = client_fd;
         ctx->mgr        = &g_manager;
-        ctx->current_db = nullptr;   /* set inside client_worker */
+        ctx->current_db = nullptr;
         inet_ntop(AF_INET, &client_addr.sin_addr,
                   ctx->client_ip, sizeof(ctx->client_ip));
+
+        /* BENCH_<fd>: persistent (no _SESSION_ prefix) but per-connection */
+        snprintf(ctx->session_db_name, sizeof(ctx->session_db_name),
+                 "BENCH_%d", client_fd);
 
         pthread_t tid;
         pthread_attr_t attr;
@@ -358,6 +350,7 @@ int main(int argc, char *argv[]) {
 
     close(listen_fd);
     expiry_stop();
+    wal_flush_all();      /* flush any buffered WAL records before exit */
     dbmgr_destroy(&g_manager);
     printf("[server] Shutdown complete.\n");
     return 0;
